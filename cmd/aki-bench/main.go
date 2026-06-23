@@ -1,0 +1,186 @@
+// Command aki-bench runs a named workload against aki, Redis, and Valkey and
+// prints a side-by-side comparison plus the 2x gate verdict. It can launch the
+// servers itself or connect to addresses already running, emit JSON for CI, and
+// run the compatibility smoke check instead of a load run.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/tamnd/aki-bench/load"
+	"github.com/tamnd/aki-bench/report"
+	"github.com/tamnd/aki-bench/smoke"
+	"github.com/tamnd/aki-bench/target"
+	"github.com/tamnd/aki-bench/workload"
+)
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "aki-bench:", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	fs := flag.NewFlagSet("aki-bench", flag.ContinueOnError)
+	var (
+		wl          = fs.String("workload", "set", "workload name: "+strings.Join(workload.Names(), ", "))
+		conns       = fs.Int("connections", 50, "concurrent connections")
+		pipeline    = fs.Int("pipeline", 1, "pipeline depth per connection")
+		durationStr = fs.String("duration", "5s", "run length, for example 10s; set to 0 to use -requests")
+		requests    = fs.Int64("requests", 0, "total requests when duration is 0")
+		valueSize   = fs.Int("value-size", 64, "write payload size in bytes")
+		keyCount    = fs.Int("keys", 100000, "key space size")
+		readRatio   = fs.Int("read-ratio", 80, "read percent for the mixed workload")
+		openLoop    = fs.Bool("open-loop", false, "open-loop mode with coordinated-omission correction")
+		targetRate  = fs.Int64("rate", 0, "open-loop aggregate target ops/sec")
+		durable     = fs.Bool("durable", false, "launch servers in durable config instead of in-memory")
+		required    = fs.Float64("gate", report.DefaultRequiredSpeedup, "required speedup over Redis and Valkey")
+		jsonOut     = fs.String("json", "", "write the comparison JSON to this file")
+		smokeOnly   = fs.Bool("smoke", false, "run the compatibility smoke check instead of a load run")
+
+		akiAddr    = fs.String("aki-addr", "", "connect to a running aki at host:port instead of launching")
+		redisAddr  = fs.String("redis-addr", "", "connect to a running redis at host:port instead of launching")
+		valkeyAddr = fs.String("valkey-addr", "", "connect to a running valkey at host:port instead of launching")
+		akiBin     = fs.String("aki-bin", "aki", "aki binary for launch mode")
+		redisBin   = fs.String("redis-bin", "redis-server", "redis binary for launch mode")
+		valkeyBin  = fs.String("valkey-bin", "valkey-server", "valkey binary for launch mode")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	duration, err := time.ParseDuration(*durationStr)
+	if err != nil {
+		return fmt.Errorf("bad -duration: %w", err)
+	}
+
+	dur := target.InMemory
+	if *durable {
+		dur = target.Durable
+	}
+
+	specs := []target.Spec{
+		{Kind: target.Aki, Binary: *akiBin, Addr: *akiAddr, Durability: dur},
+		{Kind: target.Redis, Binary: *redisBin, Addr: *redisAddr, Durability: dur},
+		{Kind: target.Valkey, Binary: *valkeyBin, Addr: *valkeyAddr, Durability: dur},
+	}
+
+	targets := map[target.Kind]*target.Target{}
+	for _, s := range specs {
+		t, err := target.Provide(s)
+		if err != nil {
+			if target.IsSkip(err) {
+				fmt.Fprintf(os.Stderr, "skip %s: %v\n", s.Kind, err)
+				continue
+			}
+			return err
+		}
+		targets[s.Kind] = t
+		defer t.Close()
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no targets available, install aki/redis-server/valkey-server or pass -*-addr")
+	}
+
+	if *smokeOnly {
+		return runSmoke(targets)
+	}
+
+	spec := workload.Spec{
+		Name:      *wl,
+		ValueSize: *valueSize,
+		KeyCount:  *keyCount,
+		ReadRatio: *readRatio,
+	}
+	gen := workload.Build(*wl, spec)
+	if gen == nil {
+		return fmt.Errorf("unknown workload %q, choose one of %s", *wl, strings.Join(workload.Names(), ", "))
+	}
+
+	mode := load.ClosedLoop
+	if *openLoop {
+		mode = load.OpenLoop
+	}
+
+	entry := func(k target.Kind, name string) report.Entry {
+		t, ok := targets[k]
+		if !ok {
+			return report.Skipped(name, *wl)
+		}
+		cfg := load.Config{
+			Addr:        t.Addr,
+			Connections: *conns,
+			Pipeline:    *pipeline,
+			Duration:    duration,
+			Requests:    *requests,
+			Mode:        mode,
+			TargetRate:  *targetRate,
+			Gen:         gen,
+		}
+		res, err := load.Run(context.Background(), cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "run %s: %v\n", k, err)
+			return report.Skipped(name, *wl)
+		}
+		return report.FromResult(name, *wl, res)
+	}
+
+	cmp := report.NewComparison(*wl,
+		entry(target.Aki, "aki"),
+		entry(target.Redis, "redis"),
+		entry(target.Valkey, "valkey"),
+		*required,
+	)
+	cmp.WriteTable(os.Stdout)
+
+	if *jsonOut != "" {
+		f, err := os.Create(*jsonOut)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if err := cmp.WriteJSON(f); err != nil {
+			return err
+		}
+	}
+
+	if !cmp.Gate.Pass {
+		os.Exit(2)
+	}
+	return nil
+}
+
+func runSmoke(targets map[target.Kind]*target.Target) error {
+	names := map[target.Kind]string{target.Aki: "aki", target.Redis: "redis", target.Valkey: "valkey"}
+	allPass := true
+	for _, k := range []target.Kind{target.Aki, target.Redis, target.Valkey} {
+		t, ok := targets[k]
+		if !ok {
+			continue
+		}
+		res := smoke.Run(names[k], t.Addr)
+		status := "PASS"
+		if !res.Pass() {
+			status = "FAIL"
+			allPass = false
+		}
+		fmt.Printf("%s smoke: %s\n", res.Target, status)
+		for _, c := range res.Checks {
+			mark := "ok"
+			if !c.OK {
+				mark = "FAIL " + c.Detail
+			}
+			fmt.Printf("  %-12s %s\n", c.Name, mark)
+		}
+	}
+	if !allPass {
+		os.Exit(2)
+	}
+	return nil
+}
