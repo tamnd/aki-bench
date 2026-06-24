@@ -33,11 +33,11 @@ type Durability int
 const (
 	// InMemory disables persistence on every server so the comparison isolates
 	// command execution. For Redis and Valkey that means no save points and no
-	// appendonly. aki runs without fsync on commit.
+	// appendonly. aki runs with the append-only file off so commits do not fsync.
 	InMemory Durability = iota
-	// Durable turns on an fsync-per-write-ish config on every server: appendonly
-	// everywhere for Redis and Valkey, durable commits for aki. This is the
-	// config that actually proves a fair durable-vs-durable number.
+	// Durable turns on an fsync-per-write config on every server: appendonly with
+	// appendfsync always everywhere, including aki. This is the config that
+	// actually proves a fair durable-vs-durable number.
 	Durable
 )
 
@@ -159,11 +159,15 @@ func launchArgs(k Kind, port int, dataDir string, d Durability) []string {
 	p := strconv.Itoa(port)
 	switch k {
 	case Aki:
-		// aki's server subcommand takes an address and a data file. Durability
-		// maps to whether commits fsync.
-		args := []string{"server", "--addr", "127.0.0.1:" + p, "--data", dataDir + "/data.aki"}
-		if d == InMemory {
-			args = append(args, "--no-fsync")
+		// aki's server subcommand takes a listen address and a working directory,
+		// and it speaks the same appendonly and appendfsync flags as Redis. Mapping
+		// durability through those flags keeps the fairness config identical across
+		// all three servers.
+		args := []string{"server", "--addr", "127.0.0.1:" + p, "--dir", dataDir}
+		if d == Durable {
+			args = append(args, "--appendonly", "yes", "--appendfsync", "always")
+		} else {
+			args = append(args, "--appendonly", "no")
 		}
 		return args
 	case Redis, Valkey:

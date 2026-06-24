@@ -51,6 +51,21 @@ func TestLaunchArgsFairness(t *testing.T) {
 	if !contains(dur, "yes") || !contains(dur, "always") {
 		t.Fatalf("durable redis should set appendonly always: %v", dur)
 	}
+
+	akiMem := launchArgs(Aki, 6400, "/tmp/x", InMemory)
+	if !contains(akiMem, "--addr") || !contains(akiMem, "127.0.0.1:6400") {
+		t.Fatalf("aki should listen on the chosen addr: %v", akiMem)
+	}
+	if !contains(akiMem, "--dir") || !contains(akiMem, "/tmp/x") {
+		t.Fatalf("aki should use the data dir: %v", akiMem)
+	}
+	if !contains(akiMem, "no") {
+		t.Fatalf("in-memory aki should disable appendonly: %v", akiMem)
+	}
+	akiDur := launchArgs(Aki, 6400, "/tmp/x", Durable)
+	if !contains(akiDur, "yes") || !contains(akiDur, "always") {
+		t.Fatalf("durable aki should set appendonly always: %v", akiDur)
+	}
 }
 
 func contains(ss []string, want string) bool {
