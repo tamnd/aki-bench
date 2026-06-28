@@ -17,6 +17,8 @@ type fakeServer struct {
 	wg   sync.WaitGroup
 	mu   sync.Mutex
 	data map[string]string
+	// info is the body returned for INFO; empty falls back to a redis 8.8.0 block.
+	info string
 }
 
 func newFakeServer() (*fakeServer, error) {
@@ -156,6 +158,12 @@ func (s *fakeServer) reply(w *bufio.Writer, argv []string) {
 		s.data[argv[1]] = strconv.FormatInt(n, 10)
 		s.mu.Unlock()
 		writeInt(w, n)
+	case "INFO":
+		body := s.info
+		if body == "" {
+			body = "# Server\r\nredis_version:8.8.0\r\nredis_mode:standalone\r\n"
+		}
+		writeBulk(w, body)
 	case "EXPIRE":
 		writeInt(w, 1)
 	case "LPUSH", "RPUSH", "SADD", "ZADD", "HSET":
