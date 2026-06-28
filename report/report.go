@@ -1,8 +1,10 @@
 // Package report turns load results into a side-by-side comparison and the 2x
 // acceptance gate. It prints a human table and emits JSON for CI artifacts.
 // The gate is the single function that decides whether aki met its goal: aki must
-// be at least 2x the throughput of both Redis 7.4 and Valkey on the same
-// workload, and no worse on tail latency.
+// be at least 2x the throughput of both the current Redis and Valkey on the same
+// workload, and no worse on tail latency. Each entry carries the server's
+// self-reported version so the verdict names the exact builds it was measured
+// against.
 package report
 
 import (
@@ -17,15 +19,25 @@ import (
 
 // Entry is one target's measured result for a workload.
 type Entry struct {
-	Target    string  `json:"target"`   // aki, redis, or valkey
-	Workload  string  `json:"workload"` // workload name
-	Skipped   bool    `json:"skipped"`  // true when the target was absent
-	Ops       int64   `json:"ops"`      // successful operations
-	Errors    int64   `json:"errors"`   // failed operations
+	Target    string  `json:"target"`            // aki, redis, or valkey
+	Version   string  `json:"version,omitempty"` // server's self-reported identity, e.g. "redis 8.8.0"
+	Workload  string  `json:"workload"`          // workload name
+	Skipped   bool    `json:"skipped"`           // true when the target was absent
+	Ops       int64   `json:"ops"`               // successful operations
+	Errors    int64   `json:"errors"`            // failed operations
 	OpsPerSec float64 `json:"ops_per_sec"`
 	P50us     float64 `json:"p50_us"` // latency percentiles in microseconds
 	P99us     float64 `json:"p99_us"`
 	P999us    float64 `json:"p999_us"`
+}
+
+// WithVersion returns the entry tagged with a server's self-reported identity,
+// so the comparison records the exact version measured rather than the binary
+// name the operator launched. A run that benches an old redis-server on PATH and
+// labels it the target version is the failure this closes.
+func (e Entry) WithVersion(v string) Entry {
+	e.Version = v
+	return e
 }
 
 // FromResult builds an Entry from a load.Result.
@@ -71,7 +83,7 @@ type Gate struct {
 	TailRegressedValk  bool    `json:"tail_regressed_vs_valkey"`
 }
 
-// DefaultRequiredSpeedup is the project goal: 2x Redis 7.4 and Valkey.
+// DefaultRequiredSpeedup is the project goal: 2x the current Redis and Valkey.
 const DefaultRequiredSpeedup = 2.0
 
 // EvaluateGate is the exact acceptance gate.
@@ -133,18 +145,22 @@ func NewComparison(workload string, aki, redis, valkey Entry, required float64) 
 func (c Comparison) WriteTable(w io.Writer) {
 	fmt.Fprintf(w, "workload: %s\n", c.Workload)
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "target\tops/sec\tp50 us\tp99 us\tp999 us\tnote")
+	fmt.Fprintln(tw, "target\tversion\tops/sec\tp50 us\tp99 us\tp999 us\tnote")
 	for _, e := range []Entry{c.Aki, c.Redis, c.Valkey} {
+		ver := e.Version
+		if ver == "" {
+			ver = "-"
+		}
 		if e.Skipped {
-			fmt.Fprintf(tw, "%s\t-\t-\t-\t-\tskipped\n", e.Target)
+			fmt.Fprintf(tw, "%s\t%s\t-\t-\t-\t-\tskipped\n", e.Target, ver)
 			continue
 		}
 		note := ""
 		if e.Errors > 0 {
 			note = fmt.Sprintf("%d errors", e.Errors)
 		}
-		fmt.Fprintf(tw, "%s\t%.0f\t%.1f\t%.1f\t%.1f\t%s\n",
-			e.Target, e.OpsPerSec, e.P50us, e.P99us, e.P999us, note)
+		fmt.Fprintf(tw, "%s\t%s\t%.0f\t%.1f\t%.1f\t%.1f\t%s\n",
+			e.Target, ver, e.OpsPerSec, e.P50us, e.P99us, e.P999us, note)
 	}
 	tw.Flush()
 
