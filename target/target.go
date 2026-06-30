@@ -128,11 +128,21 @@ func launch(s Spec) (*Target, error) {
 }
 
 // Close stops a launched server and removes its data directory. It is a no-op
-// for a connect-mode target.
+// for a connect-mode target. The Wait after Kill is bounded by a timeout so a
+// process wedged in uninterruptible I/O cannot hang the harness: across a
+// multi-cell sweep one stuck Close would otherwise stall every later cell.
 func (t *Target) Close() error {
 	if t.cmd != nil && t.cmd.Process != nil {
 		_ = t.cmd.Process.Kill()
-		_ = t.cmd.Wait()
+		done := make(chan struct{})
+		go func() {
+			_ = t.cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
 	}
 	if t.dataDir != "" {
 		_ = os.RemoveAll(t.dataDir)
