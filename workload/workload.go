@@ -234,6 +234,30 @@ func Build(name string, s Spec) load.CommandGen {
 	return nil
 }
 
+// PreloadFor returns a write generator that populates the key space a flat read
+// workload needs before the timed run, the number of preload ops, and true; or
+// ok=false for workloads that create their own keys (writes) and so need no
+// preload. GET and the mixed profile read keys that must already exist: without
+// a preload every GET is a miss that short-circuits before touching storage, so
+// the comparison would measure the miss path, not a real read. The preload
+// writes one SET per key over the whole key space; driven by a single connection
+// it walks seq 0..KeyCount-1 so every key is written exactly once, the same
+// coverage rule the collection plans use.
+func PreloadFor(name string, s Spec) (load.CommandGen, int64, bool) {
+	s = s.withDefaults()
+	switch name {
+	case "get", "mixed":
+		set := []byte("SET")
+		val := value(s.ValueSize)
+		n := int64(s.KeyCount)
+		return func(conn int, seq int64) [][]byte {
+			return [][]byte{set, keyAt("key:", seq%n), val}
+		}, n, true
+	default:
+		return nil, 0, false
+	}
+}
+
 // ValueSizeSweep is the default set of payload sizes to sweep.
 func ValueSizeSweep() []int { return []int{16, 64, 256, 1024, 4096} }
 

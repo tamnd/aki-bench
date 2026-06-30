@@ -43,16 +43,16 @@ func TestProvideMissingBinarySkips(t *testing.T) {
 }
 
 func TestLaunchArgsFairness(t *testing.T) {
-	mem := launchArgs(Redis, 6400, "/tmp/x", InMemory)
+	mem := launchArgs(Redis, 6400, "/tmp/x", InMemory, "", "")
 	if !contains(mem, "no") {
 		t.Fatalf("in-memory redis should disable appendonly: %v", mem)
 	}
-	dur := launchArgs(Redis, 6400, "/tmp/x", Durable)
+	dur := launchArgs(Redis, 6400, "/tmp/x", Durable, "", "")
 	if !contains(dur, "yes") || !contains(dur, "always") {
 		t.Fatalf("durable redis should set appendonly always: %v", dur)
 	}
 
-	akiMem := launchArgs(Aki, 6400, "/tmp/x", InMemory)
+	akiMem := launchArgs(Aki, 6400, "/tmp/x", InMemory, "", "")
 	if !contains(akiMem, "--addr") || !contains(akiMem, "127.0.0.1:6400") {
 		t.Fatalf("aki should listen on the chosen addr: %v", akiMem)
 	}
@@ -62,9 +62,23 @@ func TestLaunchArgsFairness(t *testing.T) {
 	if !contains(akiMem, "no") {
 		t.Fatalf("in-memory aki should disable appendonly: %v", akiMem)
 	}
-	akiDur := launchArgs(Aki, 6400, "/tmp/x", Durable)
+	akiDur := launchArgs(Aki, 6400, "/tmp/x", Durable, "", "")
 	if !contains(akiDur, "yes") || !contains(akiDur, "always") {
 		t.Fatalf("durable aki should set appendonly always: %v", akiDur)
+	}
+
+	// The engine and net selectors must reach aki's flags when set, and Redis must
+	// never receive them.
+	akiEng := launchArgs(Aki, 6400, "/tmp/x", InMemory, "hot", "reactor")
+	if !contains(akiEng, "--aki-engine") || !contains(akiEng, "hot") {
+		t.Fatalf("aki should pass the engine flag: %v", akiEng)
+	}
+	if !contains(akiEng, "--aki-net") || !contains(akiEng, "reactor") {
+		t.Fatalf("aki should pass the net flag: %v", akiEng)
+	}
+	redisEng := launchArgs(Redis, 6400, "/tmp/x", InMemory, "hot", "reactor")
+	if contains(redisEng, "--aki-engine") || contains(redisEng, "--aki-net") {
+		t.Fatalf("redis must not receive aki engine flags: %v", redisEng)
 	}
 }
 

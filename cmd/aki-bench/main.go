@@ -65,6 +65,8 @@ func run(args []string) error {
 		akiBin     = fs.String("aki-bin", "aki", "aki binary for launch mode")
 		redisBin   = fs.String("redis-bin", "redis-server", "redis binary for launch mode")
 		valkeyBin  = fs.String("valkey-bin", "valkey-server", "valkey binary for launch mode")
+		akiEngine  = fs.String("aki-engine", "hot", "aki string-path engine in launch mode: btree, hybrid, or hot (default; the engine aki is optimized for, so a baseline never silently measures the old B-tree)")
+		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -80,8 +82,19 @@ func run(args []string) error {
 		dur = target.Durable
 	}
 
+	// The hot and hybrid engines are in-memory only in this slice, so a durable
+	// comparison on them would pit a non-durable aki against fsync-per-write Redis
+	// and Valkey, which is not a fair durable-vs-durable number. In durable mode
+	// fall back to the durable B-tree and say so, rather than quietly reporting an
+	// unfair win.
+	engine := *akiEngine
+	if dur == target.Durable && (engine == "hot" || engine == "hybrid") {
+		fmt.Fprintf(os.Stderr, "durable mode: %s engine is in-memory only, using btree for a fair durable comparison\n", engine)
+		engine = "btree"
+	}
+
 	specs := []target.Spec{
-		{Kind: target.Aki, Binary: *akiBin, Addr: *akiAddr, Durability: dur},
+		{Kind: target.Aki, Binary: *akiBin, Addr: *akiAddr, Durability: dur, AkiEngine: engine, AkiNet: *akiNet},
 		{Kind: target.Redis, Binary: *redisBin, Addr: *redisAddr, Durability: dur},
 		{Kind: target.Valkey, Binary: *valkeyBin, Addr: *valkeyAddr, Durability: dur},
 	}
@@ -159,6 +172,24 @@ func run(args []string) error {
 				return report.Skipped(name, *wl)
 			}
 			probe = plan.Probe
+		} else if preGen, preOps, ok := workload.PreloadFor(*wl, spec); ok {
+			// Flat read workloads (get, mixed) need their key space populated, or
+			// every read is a miss that short-circuits before storage. Walk the key
+			// space once on a single connection so every key exists, then time the
+			// reads against a warm store, matching the collection-plan preload.
+			pre := load.Config{
+				Addr:        t.Addr,
+				Connections: 1,
+				Pipeline:    256,
+				Duration:    0,
+				Requests:    preOps,
+				Mode:        load.ClosedLoop,
+				Gen:         preGen,
+			}
+			if _, err := load.Run(context.Background(), pre); err != nil {
+				fmt.Fprintf(os.Stderr, "preload %s: %v\n", k, err)
+				return report.Skipped(name, *wl)
+			}
 		}
 		cfg := load.Config{
 			Addr:        t.Addr,
