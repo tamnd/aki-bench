@@ -29,13 +29,16 @@ func main() {
 func run(args []string) error {
 	fs := flag.NewFlagSet("aki-bench", flag.ContinueOnError)
 	var (
-		wl          = fs.String("workload", "set", "workload name: "+strings.Join(workload.Names(), ", "))
+		wl          = fs.String("workload", "set", "workload name: "+strings.Join(allWorkloadNames(), ", "))
 		conns       = fs.Int("connections", 50, "concurrent connections")
 		pipeline    = fs.Int("pipeline", 1, "pipeline depth per connection")
 		durationStr = fs.String("duration", "5s", "run length, for example 10s; set to 0 to use -requests")
 		requests    = fs.Int64("requests", 0, "total requests when duration is 0")
 		valueSize   = fs.Int("value-size", 64, "write payload size in bytes")
 		keyCount    = fs.Int("keys", 100000, "key space size")
+		members     = fs.Int("members", 0, "member space for collection point-read workloads; defaults to -keys")
+		dist        = fs.String("dist", "uniform", "access pattern over the space: uniform or zipfian")
+		zipfS       = fs.Float64("zipf-s", 0.99, "zipfian skew exponent when -dist is zipfian")
 		readRatio   = fs.Int("read-ratio", 80, "read percent for the mixed workload")
 		openLoop    = fs.Bool("open-loop", false, "open-loop mode with coordinated-omission correction")
 		targetRate  = fs.Int64("rate", 0, "open-loop aggregate target ops/sec")
@@ -96,11 +99,22 @@ func run(args []string) error {
 		Name:      *wl,
 		ValueSize: *valueSize,
 		KeyCount:  *keyCount,
+		Members:   *members,
+		Dist:      *dist,
+		ZipfS:     *zipfS,
 		ReadRatio: *readRatio,
 	}
+	if *dist != "uniform" && *dist != "zipfian" {
+		return fmt.Errorf("unknown -dist %q, choose uniform or zipfian", *dist)
+	}
+
+	// A workload is either a flat generator (get/set/...) or a collection
+	// point-read plan (sismember/hget/zscore/zrank). A plan has a preload phase
+	// that builds the single probed collection before the measured reads.
 	gen := workload.Build(*wl, spec)
-	if gen == nil {
-		return fmt.Errorf("unknown workload %q, choose one of %s", *wl, strings.Join(workload.Names(), ", "))
+	plan, isPlan := workload.BuildPlan(*wl, spec)
+	if gen == nil && !isPlan {
+		return fmt.Errorf("unknown workload %q, choose one of %s", *wl, strings.Join(allWorkloadNames(), ", "))
 	}
 
 	mode := load.ClosedLoop
@@ -113,6 +127,27 @@ func run(args []string) error {
 		if !ok {
 			return report.Skipped(name, *wl)
 		}
+		// For a collection plan, build the probed collection first. The preload
+		// runs on one connection so a single sequence 0..PreloadOps-1 populates
+		// every member exactly once; a multi-connection preload would restart the
+		// sequence per connection and under-populate the collection.
+		probe := gen
+		if isPlan {
+			pre := load.Config{
+				Addr:        t.Addr,
+				Connections: 1,
+				Pipeline:    256,
+				Duration:    0,
+				Requests:    plan.PreloadOps,
+				Mode:        load.ClosedLoop,
+				Gen:         plan.Preload,
+			}
+			if _, err := load.Run(context.Background(), pre); err != nil {
+				fmt.Fprintf(os.Stderr, "preload %s: %v\n", k, err)
+				return report.Skipped(name, *wl)
+			}
+			probe = plan.Probe
+		}
 		cfg := load.Config{
 			Addr:        t.Addr,
 			Connections: *conns,
@@ -121,7 +156,7 @@ func run(args []string) error {
 			Requests:    *requests,
 			Mode:        mode,
 			TargetRate:  *targetRate,
-			Gen:         gen,
+			Gen:         probe,
 		}
 		res, err := load.Run(context.Background(), cfg)
 		if err != nil {
@@ -154,6 +189,12 @@ func run(args []string) error {
 		os.Exit(2)
 	}
 	return nil
+}
+
+// allWorkloadNames lists every selectable workload: the flat generators plus the
+// collection point-read plans.
+func allWorkloadNames() []string {
+	return append(append([]string{}, workload.Names()...), workload.PlanNames()...)
 }
 
 func runSmoke(targets map[target.Kind]*target.Target) error {

@@ -14,10 +14,13 @@ import (
 
 // Spec parameterizes a workload.
 type Spec struct {
-	Name      string // workload name, for example "set" or "mixed-8020"
-	ValueSize int    // payload size in bytes for write commands
-	KeyCount  int    // size of the key space; keys cycle 0..KeyCount-1
-	ReadRatio int    // percent of operations that are reads, mixed workload only
+	Name      string  // workload name, for example "set" or "mixed-8020"
+	ValueSize int     // payload size in bytes for write commands
+	KeyCount  int     // size of the key space; keys cycle 0..KeyCount-1
+	ReadRatio int     // percent of operations that are reads, mixed workload only
+	Members   int     // member space for a single-collection probe (sismember, hget, ...)
+	Dist      string  // access pattern over the space: "uniform" (default) or "zipfian"
+	ZipfS     float64 // zipfian skew exponent, used when Dist is "zipfian"; 0 means 0.99
 }
 
 func (s Spec) withDefaults() Spec {
@@ -27,7 +30,34 @@ func (s Spec) withDefaults() Spec {
 	if s.KeyCount <= 0 {
 		s.KeyCount = 100000
 	}
+	if s.Members <= 0 {
+		s.Members = s.KeyCount
+	}
+	if s.ZipfS <= 0 {
+		s.ZipfS = 0.99
+	}
 	return s
+}
+
+// keySelector returns the access pattern over the top-level key space. Uniform is
+// the default and the historical behavior; zipfian concentrates traffic on a hot
+// head of keys, which is the shape a read cache and the F2 hot tier are built for.
+func (s Spec) keySelector() Selector {
+	if s.Dist == "zipfian" {
+		return zipfianSelector(int64(s.KeyCount), s.ZipfS)
+	}
+	return uniformSelector(int64(s.KeyCount))
+}
+
+// memberSelector returns the access pattern over a single collection's member
+// space, used by the collection point-read probes (sismember, hget, zscore,
+// zrank). Same uniform-or-zipfian choice as keySelector, over Members rather than
+// KeyCount.
+func (s Spec) memberSelector() Selector {
+	if s.Dist == "zipfian" {
+		return zipfianSelector(int64(s.Members), s.ZipfS)
+	}
+	return uniformSelector(int64(s.Members))
 }
 
 // value builds a deterministic payload of the configured size. The content does
@@ -41,11 +71,10 @@ func value(size int) []byte {
 	return v
 }
 
-// key returns the key for a given sequence number within the key space.
-// Keys are spread across the space by the sequence so a run touches the whole
-// keyspace evenly rather than hammering one slot.
-func key(prefix string, seq int64, keyCount int) []byte {
-	idx := seq % int64(keyCount)
+// keyAt returns the key for a given key-space index. The index is produced by a
+// Selector, so the access pattern (uniform or zipfian) lives in one place and the
+// generators just format whatever slot the selector picks.
+func keyAt(prefix string, idx int64) []byte {
 	return []byte(prefix + strconv.FormatInt(idx, 10))
 }
 
@@ -75,48 +104,53 @@ func Names() []string {
 // fair GET run should be preceded by a SET pass over the same key space.
 func Get(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("GET")
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, key("key:", seq, s.KeyCount)}
+		return [][]byte{cmd, keyAt("key:", sel(seq))}
 	}
 }
 
 // Set writes a fixed-size value across the key space.
 func Set(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("SET")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, key("key:", seq, s.KeyCount), val}
+		return [][]byte{cmd, keyAt("key:", sel(seq)), val}
 	}
 }
 
 // Incr increments counters across the key space.
 func Incr(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("INCR")
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, key("ctr:", seq, s.KeyCount)}
+		return [][]byte{cmd, keyAt("ctr:", sel(seq))}
 	}
 }
 
 // LPush prepends to lists across the key space.
 func LPush(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("LPUSH")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, key("list:", seq, s.KeyCount), val}
+		return [][]byte{cmd, keyAt("list:", sel(seq)), val}
 	}
 }
 
 // RPush appends to lists across the key space.
 func RPush(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("RPUSH")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, key("list:", seq, s.KeyCount), val}
+		return [][]byte{cmd, keyAt("list:", sel(seq)), val}
 	}
 }
 
@@ -124,46 +158,50 @@ func RPush(s Spec) load.CommandGen {
 // so sets actually grow rather than re-adding the same element.
 func SAdd(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("SADD")
 	return func(conn int, seq int64) [][]byte {
 		member := []byte("m" + strconv.FormatInt(seq, 10))
-		return [][]byte{cmd, key("set:", seq, s.KeyCount), member}
+		return [][]byte{cmd, keyAt("set:", sel(seq)), member}
 	}
 }
 
 // ZAdd adds scored members to sorted sets across the key space.
 func ZAdd(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("ZADD")
 	return func(conn int, seq int64) [][]byte {
 		score := []byte(strconv.FormatInt(seq, 10))
 		member := []byte("m" + strconv.FormatInt(seq, 10))
-		return [][]byte{cmd, key("zset:", seq, s.KeyCount), score, member}
+		return [][]byte{cmd, keyAt("zset:", sel(seq)), score, member}
 	}
 }
 
 // HSet sets a field on hashes across the key space.
 func HSet(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("HSET")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
 		field := []byte("f" + strconv.FormatInt(seq%64, 10))
-		return [][]byte{cmd, key("hash:", seq, s.KeyCount), field, val}
+		return [][]byte{cmd, keyAt("hash:", sel(seq)), field, val}
 	}
 }
 
 // MSet writes three keys per command across the key space.
 func MSet(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	cmd := []byte("MSET")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
 		return [][]byte{
 			cmd,
-			key("key:", seq*3, s.KeyCount), val,
-			key("key:", seq*3+1, s.KeyCount), val,
-			key("key:", seq*3+2, s.KeyCount), val,
+			keyAt("key:", sel(seq*3)), val,
+			keyAt("key:", sel(seq*3+1)), val,
+			keyAt("key:", sel(seq*3+2)), val,
 		}
 	}
 }
@@ -172,6 +210,7 @@ func MSet(s Spec) load.CommandGen {
 // it issues four reads for every write, the common cache-style profile.
 func Mixed(s Spec) load.CommandGen {
 	s = s.withDefaults()
+	sel := s.keySelector()
 	ratio := s.ReadRatio
 	if ratio <= 0 || ratio >= 100 {
 		ratio = 80
@@ -181,9 +220,9 @@ func Mixed(s Spec) load.CommandGen {
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
 		if int(seq%100) < ratio {
-			return [][]byte{get, key("key:", seq, s.KeyCount)}
+			return [][]byte{get, keyAt("key:", sel(seq))}
 		}
-		return [][]byte{set, key("key:", seq, s.KeyCount), val}
+		return [][]byte{set, keyAt("key:", sel(seq)), val}
 	}
 }
 
