@@ -99,6 +99,18 @@ It also pins each launched server to a private port and a fresh data directory s
 Hardware, kernel, and NUMA effects are out of scope for the harness itself.
 Run it on the machine you care about and keep the targets on the same host so the network path is identical for all three.
 
+### Co-located client and CPU partitioning
+
+When the harness launches a server and drives it from the same box, the Go load generator and the server threads fight for the same cores.
+On a busy multi-core machine that fight starves the server and understates the ratio: a GET workload that clears 2x when the load runs on separate cores can read as 1.79x co-located, purely because the client stole the server's cores.
+The cleanest fix is to run the load generator on a different box through connect mode (`-aki-addr`, `-redis-addr`, `-valkey-addr`).
+
+When only one box is available, `-cpu-split` partitions the cores so the launched server and the load generator never share one.
+On Linux it re-execs the harness under `taskset` pinned to a client core set and launches every server pinned to the disjoint server set, the same way `redis-benchmark --threads N` keeps its load threads off the server.
+The split is applied identically to aki, Redis, and Valkey, so the comparison stays fair.
+By default the client takes a quarter of the machine (floor of two cores) and the server takes the rest; `-cpu-server` and `-cpu-client` override the two `taskset -c` lists.
+On a 6-core box the default is a 4-core server and a 2-core client, which matches the `redis-benchmark --threads 4` cross check.
+
 ## Compatibility
 
 This repo ships a small smoke check only: PING, SET, GET, INCR, and EXPIRE round-trips compared across targets.
@@ -110,6 +122,7 @@ The deep behavioral compatibility suite lives in a separate repo, tamnd/aki-comp
 - `load` native RESP client, closed-loop and open-loop load generator, and the HdrHistogram
 - `workload` the standard command mixes and the value-size and key-count sweeps
 - `target` launch or connect to aki, Redis, and Valkey, with graceful skip when a binary is absent
+- `cpuset` partition the cores between the load generator and the launched server so neither starves the other
 - `report` the side-by-side table, the JSON artifact, and the 2x gate
 - `smoke` the compatibility smoke check
 - `cmd/aki-bench` the CLI that ties it together

@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/tamnd/aki-bench/cpuset"
 	"github.com/tamnd/aki-bench/load"
 	"github.com/tamnd/aki-bench/report"
 	"github.com/tamnd/aki-bench/smoke"
@@ -68,6 +70,10 @@ func run(args []string) error {
 		valkeyBin  = fs.String("valkey-bin", "valkey-server", "valkey binary for launch mode")
 		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product) or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
 		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
+
+		cpuSplit  = fs.Bool("cpu-split", false, "partition cores so the launched server and the load generator never share a core (Linux launch mode); removes the co-located-client starvation that understates the ratio")
+		cpuServer = fs.String("cpu-server", "", "taskset -c list for the server half of -cpu-split, for example 0-3; empty auto-derives from the core count")
+		cpuClient = fs.String("cpu-client", "", "taskset -c list for the load-generator half of -cpu-split, for example 4-5; empty auto-derives from the core count")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -103,10 +109,18 @@ func run(args []string) error {
 		akiServerBin = *f1srvBin
 	}
 
+	// Pin the launched server and this load generator to disjoint cores when
+	// asked. On a co-located run the Go client and the server otherwise fight for
+	// the same cores, which starves the server and understates the ratio. The
+	// server half is stamped into every spec so aki, Redis, and Valkey are all
+	// measured under the same partition.
+	launching := *akiAddr == "" || *redisAddr == "" || *valkeyAddr == ""
+	serverCPUs := applyCPUSplit(*cpuSplit, *cpuServer, *cpuClient, launching)
+
 	specs := []target.Spec{
-		{Kind: target.Aki, Binary: akiServerBin, Addr: *akiAddr, Durability: dur, AkiEngine: engine, AkiNet: *akiNet},
-		{Kind: target.Redis, Binary: *redisBin, Addr: *redisAddr, Durability: dur},
-		{Kind: target.Valkey, Binary: *valkeyBin, Addr: *valkeyAddr, Durability: dur},
+		{Kind: target.Aki, Binary: akiServerBin, Addr: *akiAddr, Durability: dur, AkiEngine: engine, AkiNet: *akiNet, CPUList: serverCPUs},
+		{Kind: target.Redis, Binary: *redisBin, Addr: *redisAddr, Durability: dur, CPUList: serverCPUs},
+		{Kind: target.Valkey, Binary: *valkeyBin, Addr: *valkeyAddr, Durability: dur, CPUList: serverCPUs},
 	}
 
 	targets := map[target.Kind]*target.Target{}
@@ -242,6 +256,50 @@ func run(args []string) error {
 		return errGateNotMet
 	}
 	return nil
+}
+
+// cpuServerEnv carries the chosen server core list across the re-exec that pins
+// the client. After taskset re-execs the process the machine view shrinks to the
+// client cores, so the partition is decided once on the first pass and the server
+// half is read back from this variable on the pinned pass.
+const cpuServerEnv = "AKIBENCH_CPU_SERVER"
+
+// applyCPUSplit partitions the machine between the launched server and this load
+// generator and returns the taskset -c list the server should run on, or empty
+// when no split applies. On the first pass it decides the partition from the full
+// core count, records the server half, and re-execs this process pinned to the
+// client half; that re-exec does not return on success. On the pinned pass it
+// reads the server half back and returns it. A pin failure degrades to an
+// unpinned run rather than aborting.
+func applyCPUSplit(enabled bool, serverList, clientList string, launching bool) string {
+	if !enabled || !launching || !cpuset.Available() {
+		return ""
+	}
+	if v := os.Getenv(cpuServerEnv); v != "" {
+		return v
+	}
+	n := runtime.NumCPU()
+	if serverList == "" || clientList == "" {
+		s, c, err := cpuset.Partition(n, cpuset.DefaultClientCores(n))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cpu-split: %v, running unpinned\n", err)
+			return ""
+		}
+		if serverList == "" {
+			serverList = s
+		}
+		if clientList == "" {
+			clientList = c
+		}
+	}
+	fmt.Fprintf(os.Stderr, "cpu-split: server cores %s, client cores %s\n", serverList, clientList)
+	_ = os.Setenv(cpuServerEnv, serverList)
+	if _, err := cpuset.PinSelf(clientList); err != nil {
+		fmt.Fprintf(os.Stderr, "cpu-split: pin failed: %v, running unpinned\n", err)
+		_ = os.Unsetenv(cpuServerEnv)
+		return ""
+	}
+	return serverList
 }
 
 // allWorkloadNames lists every selectable workload: the flat generators plus the
