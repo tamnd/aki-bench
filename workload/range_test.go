@@ -14,6 +14,8 @@ func TestRangePlansBuildAndProbe(t *testing.T) {
 		probeKey  string // the key the probe must target
 	}{
 		{"lrange", "RPUSH", "LRANGE", 1, "list:probe"},
+		{"lpop", "RPUSH", "LPOP", 1, "list:probe"},
+		{"lindex", "RPUSH", "LINDEX", 1, "list:probe"},
 		{"zrange", "ZADD", "ZRANGE", 1, "zset:probe"},
 		{"zrangebyscore", "ZADD", "ZRANGEBYSCORE", 1, "zset:probe"},
 		{"hscan", "HSET", "HSCAN", 1, "hash:probe"},
@@ -125,6 +127,58 @@ func TestAlgebraPlansBuildTwoSources(t *testing.T) {
 		if string(probe[1]) == string(probe[2]) {
 			t.Fatalf("%s: probe references the same source twice (%q)", name, probe[1])
 		}
+	}
+}
+
+// ZUNIONSTORE builds two equal sorted sets in one pass and unions them into a
+// destination with weights. The preload must cover both source zsets and every
+// member id, and the probe must name both sources plus the WEIGHTS clause without
+// pointing at a source as the destination.
+func TestZUnionPlanBuildsTwoSources(t *testing.T) {
+	plan, ok := BuildPlan("zunion", Spec{Members: 256})
+	if !ok {
+		t.Fatal("zunion: BuildPlan returned not-a-plan")
+	}
+	if plan.PreloadOps != 512 {
+		t.Fatalf("zunion: PreloadOps = %d, want 512 (two zsets of 256)", plan.PreloadOps)
+	}
+	keys := map[string]map[string]bool{}
+	for seq := int64(0); seq < plan.PreloadOps; seq++ {
+		argv := plan.Preload(0, seq)
+		if string(argv[0]) != "ZADD" {
+			t.Fatalf("zunion: preload cmd = %q, want ZADD", argv[0])
+		}
+		key := string(argv[1])
+		if keys[key] == nil {
+			keys[key] = map[string]bool{}
+		}
+		keys[key][string(argv[3])] = true // ZADD key score member
+	}
+	if len(keys) != 2 {
+		t.Fatalf("zunion: preload wrote %d distinct zsets, want 2", len(keys))
+	}
+	for key, members := range keys {
+		if len(members) != 256 {
+			t.Fatalf("zunion: zset %s has %d members, want 256", key, len(members))
+		}
+	}
+	probe := plan.Probe(0, 0)
+	// argv: ZUNIONSTORE dest 2 a b WEIGHTS 1 1
+	if string(probe[0]) != "ZUNIONSTORE" {
+		t.Fatalf("zunion: probe cmd = %q, want ZUNIONSTORE", probe[0])
+	}
+	if string(probe[2]) != "2" {
+		t.Fatalf("zunion: numkeys = %q, want 2", probe[2])
+	}
+	src := map[string]bool{string(probe[3]): true, string(probe[4]): true}
+	if len(src) != 2 {
+		t.Fatalf("zunion: probe names the same source twice (%q, %q)", probe[3], probe[4])
+	}
+	if src[string(probe[1])] {
+		t.Fatalf("zunion: destination %q is also a source", probe[1])
+	}
+	if string(probe[5]) != "WEIGHTS" {
+		t.Fatalf("zunion: expected WEIGHTS clause, got %q", probe[5])
 	}
 }
 

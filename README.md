@@ -24,7 +24,20 @@ Two load disciplines are available:
 
 ## Workloads
 
-The standard suite covers GET, SET, INCR, LPUSH, RPUSH, SADD, ZADD, HSET, MSET, and a mixed read/write workload at a configurable read ratio.
+The suite covers every type along three shapes: a point op, a bounded range or scan, and an algebra or aggregate.
+That is the mapping the spec methodology requires, so a type's 2x verdict is read across all of its shapes rather than one lucky command.
+
+- String: `get`, `getrange`, `set`, `incr`.
+- Hash: `hset`, `hget`, `hscan`, `hgetall`.
+- Set: `sadd`, `sismember`, `sscan`, `smembers`, `sinter`, `sunion`.
+- Sorted set: `zadd`, `zscore`, `zrange`, `zrangebyscore`, `zrank`, `zunion`.
+- List: `lpush`, `rpush`, `lrange`, `lpop`, `lindex`.
+- Plus `mset` and a `mixed` read/write workload at a configurable read ratio.
+
+The point-read, range, scan, and algebra workloads run a single-connection preload that fully populates the probed collection before the timed probe.
+`getrange` reads a window of a large value, so run it with a large `-value-size` to exercise the larger-than-memory windowed-read path.
+`lpop` is destructive, so for a clean populated-pop number size `-members` at or above the op budget; once a list drains, LPOP returns nil on all three servers alike, so the ratio stays fair.
+
 Each workload is parameterized by value size and key count.
 The key count can be set large enough that the dataset exceeds RAM, which is the case that exercises aki's larger-than-memory design rather than just its in-memory hot path.
 See `workload.ValueSizeSweep` and `workload.KeySweep` for the default sweep points.

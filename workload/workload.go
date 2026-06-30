@@ -82,22 +82,23 @@ func keyAt(prefix string, idx int64) []byte {
 // constructor that applies the given value size and key count.
 func Registry() map[string]func(Spec) load.CommandGen {
 	return map[string]func(Spec) load.CommandGen{
-		"get":   Get,
-		"set":   Set,
-		"incr":  Incr,
-		"lpush": LPush,
-		"rpush": RPush,
-		"sadd":  SAdd,
-		"zadd":  ZAdd,
-		"hset":  HSet,
-		"mset":  MSet,
-		"mixed": Mixed,
+		"get":      Get,
+		"getrange": GetRange,
+		"set":      Set,
+		"incr":     Incr,
+		"lpush":    LPush,
+		"rpush":    RPush,
+		"sadd":     SAdd,
+		"zadd":     ZAdd,
+		"hset":     HSet,
+		"mset":     MSet,
+		"mixed":    Mixed,
 	}
 }
 
 // Names lists the standard workload names in a stable order.
 func Names() []string {
-	return []string{"get", "set", "incr", "lpush", "rpush", "sadd", "zadd", "hset", "mset", "mixed"}
+	return []string{"get", "getrange", "set", "incr", "lpush", "rpush", "sadd", "zadd", "hset", "mset", "mixed"}
 }
 
 // Get reads keys across the key space. It assumes the keys were populated, so a
@@ -108,6 +109,34 @@ func Get(s Spec) load.CommandGen {
 	cmd := []byte("GET")
 	return func(conn int, seq int64) [][]byte {
 		return [][]byte{cmd, keyAt("key:", sel(seq))}
+	}
+}
+
+// GetRange reads a bounded window out of a preloaded value with GETRANGE. It is
+// the string range workload, and it only gets interesting in the larger-than-
+// memory large-value case: when the value is bigger than the engine's inline
+// limit, a windowed read must touch only the chunks the window spans, not
+// materialize the whole value (see the string model spec). Run it with a large
+// -value-size so the window sits inside a value that does not fit inline. The
+// window is rangeWindow bytes and its start walks across the value by sequence so
+// reads are spread over the whole value, not pinned to the inline-served head.
+// It reads the same "key:" space Get and the get preload populate.
+func GetRange(s Spec) load.CommandGen {
+	s = s.withDefaults()
+	sel := s.keySelector()
+	cmd := []byte("GETRANGE")
+	w := int64(rangeWindow)
+	maxStart := max(int64(s.ValueSize)-w, 0)
+	return func(conn int, seq int64) [][]byte {
+		var start int64
+		if maxStart > 0 {
+			start = (seq * 2654435761) % (maxStart + 1)
+			if start < 0 {
+				start += maxStart + 1
+			}
+		}
+		end := start + w - 1
+		return [][]byte{cmd, keyAt("key:", sel(seq)), intArg(start), intArg(end)}
 	}
 }
 
@@ -237,8 +266,9 @@ func Build(name string, s Spec) load.CommandGen {
 // PreloadFor returns a write generator that populates the key space a flat read
 // workload needs before the timed run, the number of preload ops, and true; or
 // ok=false for workloads that create their own keys (writes) and so need no
-// preload. GET and the mixed profile read keys that must already exist: without
-// a preload every GET is a miss that short-circuits before touching storage, so
+// preload. GET, GETRANGE, and the mixed profile read keys that must already
+// exist: without a preload every read is a miss that short-circuits before
+// touching storage, so
 // the comparison would measure the miss path, not a real read. The preload
 // writes one SET per key over the whole key space; driven by a single connection
 // it walks seq 0..KeyCount-1 so every key is written exactly once, the same
@@ -246,7 +276,7 @@ func Build(name string, s Spec) load.CommandGen {
 func PreloadFor(name string, s Spec) (load.CommandGen, int64, bool) {
 	s = s.withDefaults()
 	switch name {
-	case "get", "mixed":
+	case "get", "getrange", "mixed":
 		set := []byte("SET")
 		val := value(s.ValueSize)
 		n := int64(s.KeyCount)

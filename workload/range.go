@@ -235,6 +235,96 @@ func SUnion(s Spec) Plan {
 	}
 }
 
+// zsetAKey and zsetBKey are the two sorted-set sources the zset algebra plan
+// builds and combines, the zset analogue of setAKey and setBKey.
+var (
+	zsetAKey = []byte("zset:" + collKey + ":a")
+	zsetBKey = []byte("zset:" + collKey + ":b")
+	zsetDest = []byte("zset:" + collKey + ":out")
+)
+
+// zAlgebraPreload populates two sorted sets over one sequential pass, the zset
+// analogue of algebraPreload. Even sequence steps write zset a, odd steps write
+// zset b, and the member id is seq/2 so each set ends with Members distinct
+// scored members. The two sets fully overlap, so a union returns Members members
+// and exercises the score-accumulating merge over both sources.
+func zAlgebraPreload(zadd []byte) load.CommandGen {
+	return func(conn int, seq int64) [][]byte {
+		key := zsetAKey
+		if seq%2 == 1 {
+			key = zsetBKey
+		}
+		id := seq / 2
+		return [][]byte{zadd, key, intArg(id), memberName(id)}
+	}
+}
+
+// ZUnion builds two equal sorted sets and probes them with ZUNIONSTORE with
+// WEIGHTS, the zset algebra workload. The store form is the one the per-type doc
+// spends the most design effort bounding: it has to stream both score indexes and
+// accumulate weighted scores into the destination without materializing either
+// source. WEIGHTS 1 1 keeps the result well defined while still driving the
+// weighted-merge path rather than the plain-union shortcut.
+func ZUnion(s Spec) Plan {
+	s = s.withDefaults()
+	zunionstore := []byte("ZUNIONSTORE")
+	two := []byte("2")
+	weights := []byte("WEIGHTS")
+	one := []byte("1")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    zAlgebraPreload([]byte("ZADD")),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{zunionstore, zsetDest, two, zsetAKey, zsetBKey, weights, one, one}
+		},
+	}
+}
+
+// LPop builds a list of Members elements and probes it with LPOP, the list point
+// read-write. LPOP is destructive, so a sustained run drains the list: size
+// Members at or above the op budget (-duration 0 -requests N with -members >= N)
+// for a run that pops a populated head throughout. Once the list empties LPOP
+// returns nil, which is the same cheap path on aki, Redis, and Valkey alike, so a
+// drained tail does not bias the ratio even though it stops measuring the
+// populated-pop cost. The list is built with RPUSH so the head pops in insertion
+// order.
+func LPop(s Spec) Plan {
+	s = s.withDefaults()
+	rpush := []byte("RPUSH")
+	lk := []byte("list:" + collKey)
+	lpop := []byte("LPOP")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{rpush, lk, memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{lpop, lk}
+		},
+	}
+}
+
+// LIndex builds a list of Members elements and probes it with LINDEX at a random
+// in-range index, the list point read at an index. RPUSH puts element i at index
+// i, so the probed index is always a hit and the read resolves one position
+// without walking the list.
+func LIndex(s Spec) Plan {
+	s = s.withDefaults()
+	sel := s.memberSelector()
+	rpush := []byte("RPUSH")
+	lk := []byte("list:" + collKey)
+	lindex := []byte("LINDEX")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{rpush, lk, memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{lindex, lk, intArg(sel(seq))}
+		},
+	}
+}
+
 // windowStart clamps a selector-chosen index so a window of rangeWindow elements
 // starting there stays inside the member space. Without the clamp a window near
 // the end of the space would run past the last element and return a short reply,
@@ -262,8 +352,11 @@ func intArg(n int64) []byte {
 func rangePlans() map[string]func(Spec) Plan {
 	return map[string]func(Spec) Plan{
 		"lrange":        LRange,
+		"lpop":          LPop,
+		"lindex":        LIndex,
 		"zrange":        ZRange,
 		"zrangebyscore": ZRangeByScore,
+		"zunion":        ZUnion,
 		"hscan":         HScan,
 		"sscan":         SScan,
 		"smembers":      SMembers,
@@ -275,5 +368,5 @@ func rangePlans() map[string]func(Spec) Plan {
 
 // rangePlanNames lists the range, scan, and algebra workloads in a stable order.
 func rangePlanNames() []string {
-	return []string{"lrange", "zrange", "zrangebyscore", "hscan", "sscan", "smembers", "hgetall", "sinter", "sunion"}
+	return []string{"lrange", "lpop", "lindex", "zrange", "zrangebyscore", "zunion", "hscan", "sscan", "smembers", "hgetall", "sinter", "sunion"}
 }
