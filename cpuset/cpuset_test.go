@@ -52,12 +52,12 @@ func TestDefaultClientCores(t *testing.T) {
 	cases := []struct {
 		numCPU, want int
 	}{
-		{2, 1},  // quarter is 0, floor 2 clamps to numCPU-1
-		{4, 2},  // quarter is 1, floor lifts to 2
-		{6, 2},  // matches the redis-benchmark --threads 4 cross check
-		{8, 2},  // quarter is 2
-		{16, 4}, // quarter is 4
-		{32, 8},
+		{2, 1},  // half is 1, leaves the server one core
+		{4, 2},  // half is 2
+		{6, 3},  // the balanced split a heavy Go client needs on a 6-core box
+		{8, 4},  // half is 4
+		{16, 8}, // half is 8
+		{32, 16},
 	}
 	for _, c := range cases {
 		if got := DefaultClientCores(c.numCPU); got != c.want {
