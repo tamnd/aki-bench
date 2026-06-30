@@ -14,6 +14,8 @@ import (
 	"os/exec"
 	"strconv"
 	"time"
+
+	"github.com/tamnd/aki-bench/cpuset"
 )
 
 // Kind identifies which server a target is.
@@ -58,6 +60,13 @@ type Spec struct {
 	// binary so a baseline never silently measures the wrong path.
 	AkiEngine string
 	AkiNet    string
+
+	// CPUList, when set, pins the launched server to those cores via taskset (a
+	// Linux taskset -c list such as "0-3"). It is applied identically to aki,
+	// Redis, and Valkey so the comparison stays fair, and it is the server half of
+	// the CPU partition that keeps the co-located load generator from stealing the
+	// server's cores. It is ignored in connect mode and on non-Linux platforms.
+	CPUList string
 }
 
 // Target is a running or reachable server.
@@ -121,7 +130,8 @@ func launch(s Spec) (*Target, error) {
 	}
 
 	args := launchArgs(s.Kind, port, dataDir, s.Durability, s.AkiEngine, s.AkiNet)
-	cmd := exec.Command(resolved, args...)
+	runBin, runArgs := cpuset.ServerWrap(s.CPUList, resolved, args)
+	cmd := exec.Command(runBin, runArgs...)
 	cmd.Dir = dataDir
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(dataDir)
