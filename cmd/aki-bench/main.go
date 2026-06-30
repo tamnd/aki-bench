@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,8 +20,19 @@ import (
 	"github.com/tamnd/aki-bench/workload"
 )
 
+// errGateNotMet signals that the run completed but the 2x speedup gate failed.
+// It maps to exit code 2. It is returned rather than calling os.Exit inside run
+// so that run's deferred Close calls actually fire: os.Exit skips defers, which
+// would orphan every launched aki/redis/valkey trio (a leak that piles up fast
+// across a multi-cell sweep, since most cells fail the gate).
+var errGateNotMet = errors.New("gate not met")
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	err := run(os.Args[1:])
+	if errors.Is(err, errGateNotMet) {
+		os.Exit(2)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "aki-bench:", err)
 		os.Exit(1)
 	}
@@ -186,7 +198,7 @@ func run(args []string) error {
 	}
 
 	if !cmp.Gate.Pass {
-		os.Exit(2)
+		return errGateNotMet
 	}
 	return nil
 }
@@ -221,7 +233,7 @@ func runSmoke(targets map[target.Kind]*target.Target) error {
 		}
 	}
 	if !allPass {
-		os.Exit(2)
+		return errGateNotMet
 	}
 	return nil
 }
