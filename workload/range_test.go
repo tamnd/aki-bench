@@ -22,6 +22,7 @@ func TestRangePlansBuildAndProbe(t *testing.T) {
 		{"sscan", "SADD", "SSCAN", 1, "set:probe"},
 		{"smembers", "SADD", "SMEMBERS", 1, "set:probe"},
 		{"hgetall", "HSET", "HGETALL", 1, "hash:probe"},
+		{"xrange", "XADD", "XRANGE", 1, "stream:probe"},
 	}
 	for _, c := range cases {
 		plan, ok := BuildPlan(c.name, Spec{Members: 1000})

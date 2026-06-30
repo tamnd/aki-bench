@@ -91,6 +91,7 @@ func Registry() map[string]func(Spec) load.CommandGen {
 		"sadd":     SAdd,
 		"zadd":     ZAdd,
 		"hset":     HSet,
+		"xadd":     XAdd,
 		"mset":     MSet,
 		"mixed":    Mixed,
 	}
@@ -98,7 +99,7 @@ func Registry() map[string]func(Spec) load.CommandGen {
 
 // Names lists the standard workload names in a stable order.
 func Names() []string {
-	return []string{"get", "getrange", "set", "incr", "lpush", "rpush", "sadd", "zadd", "hset", "mset", "mixed"}
+	return []string{"get", "getrange", "set", "incr", "lpush", "rpush", "sadd", "zadd", "hset", "xadd", "mset", "mixed"}
 }
 
 // Get reads keys across the key space. It assumes the keys were populated, so a

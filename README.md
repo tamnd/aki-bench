@@ -32,11 +32,14 @@ That is the mapping the spec methodology requires, so a type's 2x verdict is rea
 - Set: `sadd`, `sismember`, `sscan`, `smembers`, `sinter`, `sunion`.
 - Sorted set: `zadd`, `zscore`, `zrange`, `zrangebyscore`, `zrank`, `zunion`.
 - List: `lpush`, `rpush`, `lrange`, `lpop`, `lindex`.
+- Stream: `xadd`, `xrange`, `xread`, `xreadgroup`.
 - Plus `mset` and a `mixed` read/write workload at a configurable read ratio.
 
 The point-read, range, scan, and algebra workloads run a single-connection preload that fully populates the probed collection before the timed probe.
 `getrange` reads a window of a large value, so run it with a large `-value-size` to exercise the larger-than-memory windowed-read path.
 `lpop` is destructive, so for a clean populated-pop number size `-members` at or above the op budget; once a list drains, LPOP returns nil on all three servers alike, so the ratio stays fair.
+`xreadgroup` is destructive in the same way: `>` delivers each entry once into the pending list, so a sustained run drains the undelivered entries and then returns nil; size `-members` at or above the op budget for a populated-delivery number.
+`xread` reads from id 0 every call, so it stays populated and non-destructive.
 
 Each workload is parameterized by value size and key count.
 The key count can be set large enough that the dataset exceeds RAM, which is the case that exercises aki's larger-than-memory design rather than just its in-memory hot path.
