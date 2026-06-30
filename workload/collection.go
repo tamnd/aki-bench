@@ -113,6 +113,47 @@ func ZRank(s Spec) Plan {
 	}
 }
 
+// SCard builds a set of Members elements and probes it with SCARD. SCARD is a
+// counter read: it returns the cardinality from the collection header with no
+// descent and no member argument, so the probe ignores the selector and reads the
+// same key every call. This is a LEVER-READY row in the doc 06 sense, the
+// wire-path-vs-descent discriminator the baseline (doc 07 section 6 job 2) leans
+// on: if SCARD clears 2x in-memory-fit but SISMEMBER does not, the gap is the
+// descent, not the wire path.
+func SCard(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sk := []byte("set:" + collKey)
+	scard := []byte("SCARD")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{sadd, sk, memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{scard, sk}
+		},
+	}
+}
+
+// ZCard builds a sorted set of Members members and probes it with ZCARD, the zset
+// counter read. Same shape and same baseline role as SCard, over the zset header.
+func ZCard(s Spec) Plan {
+	s = s.withDefaults()
+	zadd := []byte("ZADD")
+	zk := []byte("zset:" + collKey)
+	zcard := []byte("ZCARD")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{zadd, zk, []byte(strconv.FormatInt(seq, 10)), memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{zcard, zk}
+		},
+	}
+}
+
 // PlanRegistry returns the collection point-read plans keyed by name.
 func PlanRegistry() map[string]func(Spec) Plan {
 	return map[string]func(Spec) Plan{
@@ -120,12 +161,14 @@ func PlanRegistry() map[string]func(Spec) Plan {
 		"hget":      HGet,
 		"zscore":    ZScore,
 		"zrank":     ZRank,
+		"scard":     SCard,
+		"zcard":     ZCard,
 	}
 }
 
 // PlanNames lists the collection point-read workloads in a stable order.
 func PlanNames() []string {
-	return []string{"sismember", "hget", "zscore", "zrank"}
+	return []string{"sismember", "hget", "zscore", "zrank", "scard", "zcard"}
 }
 
 // BuildPlan returns the plan for a collection point-read workload name, or false

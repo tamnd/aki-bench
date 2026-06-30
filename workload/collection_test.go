@@ -25,6 +25,8 @@ func TestPlansBuildAndProbe(t *testing.T) {
 		{"hget", "HSET", "HGET"},
 		{"zscore", "ZADD", "ZSCORE"},
 		{"zrank", "ZADD", "ZRANK"},
+		{"scard", "SADD", "SCARD"},
+		{"zcard", "ZADD", "ZCARD"},
 	}
 	for _, c := range cases {
 		plan, ok := BuildPlan(c.name, Spec{Members: 1000})
