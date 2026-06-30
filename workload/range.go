@@ -1,0 +1,279 @@
+package workload
+
+import (
+	"strconv"
+
+	"github.com/tamnd/aki-bench/load"
+)
+
+// This file adds the range, scan, and algebra workloads that round out the
+// collection coverage. The point-read plans in collection.go measure a single
+// element lookup; these measure the bound-not-materialize paths the spec set
+// cares about most: a bounded window over an ordered collection (LRANGE, ZRANGE,
+// ZRANGEBYSCORE), a bounded cursor step (HSCAN, SSCAN), the whole-collection read
+// that is the materialize worst case (SMEMBERS, HGETALL), and the streaming set
+// algebra over two sources (SINTER, SUNION).
+//
+// Every plan reuses the Plan shape from collection.go: a single-connection
+// sequential preload that fully populates the probed collection, then a measured
+// probe. The algebra plans populate two collections in one preload pass by
+// alternating the destination key, so the probe can intersect or union them.
+
+// rangeWindow is the number of elements a bounded range or scan probe asks for.
+// It is small relative to a large collection on purpose: the whole point of the
+// bound-not-materialize rule is that the cost tracks the window, not the
+// collection size, so the probe has to request a window much smaller than the
+// member space to measure that property.
+const rangeWindow = 100
+
+// LRange builds a list of Members elements and probes it with a bounded LRANGE
+// over a window that starts at a random in-range index. The list is built with
+// RPUSH so element i sits at list index i, which makes the requested window
+// deterministic and always a hit.
+func LRange(s Spec) Plan {
+	s = s.withDefaults()
+	sel := s.memberSelector()
+	rpush := []byte("RPUSH")
+	lk := []byte("list:" + collKey)
+	lrange := []byte("LRANGE")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{rpush, lk, memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			start := windowStart(sel(seq), int64(s.Members))
+			stop := start + rangeWindow - 1
+			return [][]byte{lrange, lk, intArg(start), intArg(stop)}
+		},
+	}
+}
+
+// ZRange builds a sorted set of Members members and probes it with a bounded
+// ZRANGE by rank over a window that starts at a random in-range rank. Members get
+// score equal to their index, so rank order matches insertion order and the
+// window is deterministic.
+func ZRange(s Spec) Plan {
+	s = s.withDefaults()
+	sel := s.memberSelector()
+	zadd := []byte("ZADD")
+	zk := []byte("zset:" + collKey)
+	zrange := []byte("ZRANGE")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{zadd, zk, intArg(seq), memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			start := windowStart(sel(seq), int64(s.Members))
+			stop := start + rangeWindow - 1
+			return [][]byte{zrange, zk, intArg(start), intArg(stop)}
+		},
+	}
+}
+
+// ZRangeByScore builds a sorted set of Members members and probes it with a
+// bounded ZRANGEBYSCORE over a score window. Scores equal the member index, so a
+// window [lo, lo+window-1] selects a known slice and exercises the score index
+// rather than the rank index.
+func ZRangeByScore(s Spec) Plan {
+	s = s.withDefaults()
+	sel := s.memberSelector()
+	zadd := []byte("ZADD")
+	zk := []byte("zset:" + collKey)
+	zrangebyscore := []byte("ZRANGEBYSCORE")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{zadd, zk, intArg(seq), memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			lo := windowStart(sel(seq), int64(s.Members))
+			hi := lo + rangeWindow - 1
+			return [][]byte{zrangebyscore, zk, intArg(lo), intArg(hi)}
+		},
+	}
+}
+
+// HScan builds a hash of Members fields and probes it with a single bounded HSCAN
+// step from cursor 0 with COUNT. HSCAN is the bound-not-materialize alternative to
+// HGETALL: it returns at most a COUNT-sized batch, so its cost tracks the window,
+// not the hash size.
+func HScan(s Spec) Plan {
+	s = s.withDefaults()
+	hset := []byte("HSET")
+	hk := []byte("hash:" + collKey)
+	hscan := []byte("HSCAN")
+	val := value(s.ValueSize)
+	zero := []byte("0")
+	count := []byte("COUNT")
+	cnt := intArg(rangeWindow)
+	field := func(idx int64) []byte { return []byte("f" + strconv.FormatInt(idx, 10)) }
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{hset, hk, field(seq), val}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{hscan, hk, zero, count, cnt}
+		},
+	}
+}
+
+// SScan builds a set of Members elements and probes it with a single bounded SSCAN
+// step from cursor 0 with COUNT, the bounded alternative to SMEMBERS.
+func SScan(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sk := []byte("set:" + collKey)
+	sscan := []byte("SSCAN")
+	zero := []byte("0")
+	count := []byte("COUNT")
+	cnt := intArg(rangeWindow)
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{sadd, sk, memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sscan, sk, zero, count, cnt}
+		},
+	}
+}
+
+// SMembers builds a set of Members elements and probes it with SMEMBERS, which
+// returns the whole set. This is the materialize worst case on purpose: it is the
+// command the audit flags as a risk, and the regime where a streaming reply path
+// has to keep aki ahead even though the reply is the entire collection. Keep
+// Members modest for this probe; a multi-million element SMEMBERS is a reply-size
+// benchmark, not a storage benchmark.
+func SMembers(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sk := []byte("set:" + collKey)
+	smembers := []byte("SMEMBERS")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{sadd, sk, memberName(seq)}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{smembers, sk}
+		},
+	}
+}
+
+// HGetAll builds a hash of Members fields and probes it with HGETALL, the hash
+// materialize worst case, paired with SMembers for the set side.
+func HGetAll(s Spec) Plan {
+	s = s.withDefaults()
+	hset := []byte("HSET")
+	hk := []byte("hash:" + collKey)
+	hgetall := []byte("HGETALL")
+	val := value(s.ValueSize)
+	field := func(idx int64) []byte { return []byte("f" + strconv.FormatInt(idx, 10)) }
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload: func(conn int, seq int64) [][]byte {
+			return [][]byte{hset, hk, field(seq), val}
+		},
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{hgetall, hk}
+		},
+	}
+}
+
+// setAKey and setBKey are the two sources the algebra plans build and combine.
+var (
+	setAKey = []byte("set:" + collKey + ":a")
+	setBKey = []byte("set:" + collKey + ":b")
+)
+
+// algebraPreload populates two sets over one sequential pass. Even sequence steps
+// write set a, odd steps write set b, and the member id is seq/2 so each set ends
+// with Members distinct members m0..m{Members-1}. The two sets fully overlap, so
+// SINTER returns Members elements and SUNION also returns Members; the probe cost
+// is what we measure, not the cardinality.
+func algebraPreload(sadd []byte) load.CommandGen {
+	return func(conn int, seq int64) [][]byte {
+		key := setAKey
+		if seq%2 == 1 {
+			key = setBKey
+		}
+		return [][]byte{sadd, key, memberName(seq / 2)}
+	}
+}
+
+// SInter builds two equal sets and probes them with SINTER, the streaming
+// k-way-merge intersection the set model specs. PreloadOps is twice Members
+// because the one preload pass fills both sets.
+func SInter(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sinter := []byte("SINTER")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    algebraPreload(sadd),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sinter, setAKey, setBKey}
+		},
+	}
+}
+
+// SUnion builds two equal sets and probes them with SUNION, the streaming union
+// over two sources.
+func SUnion(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sunion := []byte("SUNION")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    algebraPreload(sadd),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sunion, setAKey, setBKey}
+		},
+	}
+}
+
+// windowStart clamps a selector-chosen index so a window of rangeWindow elements
+// starting there stays inside the member space. Without the clamp a window near
+// the end of the space would run past the last element and return a short reply,
+// which would understate the work for the keys the selector concentrates on.
+func windowStart(idx, members int64) int64 {
+	last := max(members-rangeWindow, 0)
+	if idx > last {
+		idx = last
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	return idx
+}
+
+// intArg formats an integer as a command argument without allocating a string
+// header separately from the byte slice the client writes.
+func intArg(n int64) []byte {
+	return strconv.AppendInt(nil, n, 10)
+}
+
+// rangePlans returns the range, scan, and algebra plans keyed by name. They are
+// merged into PlanRegistry so main dispatches them the same way as the point-read
+// plans.
+func rangePlans() map[string]func(Spec) Plan {
+	return map[string]func(Spec) Plan{
+		"lrange":        LRange,
+		"zrange":        ZRange,
+		"zrangebyscore": ZRangeByScore,
+		"hscan":         HScan,
+		"sscan":         SScan,
+		"smembers":      SMembers,
+		"hgetall":       HGetAll,
+		"sinter":        SInter,
+		"sunion":        SUnion,
+	}
+}
+
+// rangePlanNames lists the range, scan, and algebra workloads in a stable order.
+func rangePlanNames() []string {
+	return []string{"lrange", "zrange", "zrangebyscore", "hscan", "sscan", "smembers", "hgetall", "sinter", "sunion"}
+}

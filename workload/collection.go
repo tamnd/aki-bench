@@ -1,6 +1,7 @@
 package workload
 
 import (
+	"maps"
 	"strconv"
 
 	"github.com/tamnd/aki-bench/load"
@@ -113,19 +114,23 @@ func ZRank(s Spec) Plan {
 	}
 }
 
-// PlanRegistry returns the collection point-read plans keyed by name.
+// PlanRegistry returns the collection plans keyed by name: the point-read plans
+// defined here plus the range, scan, and algebra plans from range.go.
 func PlanRegistry() map[string]func(Spec) Plan {
-	return map[string]func(Spec) Plan{
+	reg := map[string]func(Spec) Plan{
 		"sismember": SISMember,
 		"hget":      HGet,
 		"zscore":    ZScore,
 		"zrank":     ZRank,
 	}
+	maps.Copy(reg, rangePlans())
+	return reg
 }
 
-// PlanNames lists the collection point-read workloads in a stable order.
+// PlanNames lists the collection workloads in a stable order: the point-read
+// plans first, then the range, scan, and algebra plans.
 func PlanNames() []string {
-	return []string{"sismember", "hget", "zscore", "zrank"}
+	return append([]string{"sismember", "hget", "zscore", "zrank"}, rangePlanNames()...)
 }
 
 // BuildPlan returns the plan for a collection point-read workload name, or false
