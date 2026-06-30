@@ -62,10 +62,11 @@ func run(args []string) error {
 		akiAddr    = fs.String("aki-addr", "", "connect to a running aki at host:port instead of launching")
 		redisAddr  = fs.String("redis-addr", "", "connect to a running redis at host:port instead of launching")
 		valkeyAddr = fs.String("valkey-addr", "", "connect to a running valkey at host:port instead of launching")
-		akiBin     = fs.String("aki-bin", "aki", "aki binary for launch mode")
+		akiBin     = fs.String("aki-bin", "aki", "aki binary for launch mode with a legacy engine (btree, hybrid, hot)")
+		f1srvBin   = fs.String("f1srv-bin", "f1srv", "f1srv binary for launch mode with the f1raw engine (the default)")
 		redisBin   = fs.String("redis-bin", "redis-server", "redis binary for launch mode")
 		valkeyBin  = fs.String("valkey-bin", "valkey-server", "valkey binary for launch mode")
-		akiEngine  = fs.String("aki-engine", "hot", "aki string-path engine in launch mode: btree, hybrid, or hot (default; the engine aki is optimized for, so a baseline never silently measures the old B-tree)")
+		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product) or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
 		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -82,19 +83,28 @@ func run(args []string) error {
 		dur = target.Durable
 	}
 
-	// The hot and hybrid engines are in-memory only in this slice, so a durable
+	// f1raw, hot, and hybrid are in-memory only in this slice, so a durable
 	// comparison on them would pit a non-durable aki against fsync-per-write Redis
 	// and Valkey, which is not a fair durable-vs-durable number. In durable mode
 	// fall back to the durable B-tree and say so, rather than quietly reporting an
 	// unfair win.
 	engine := *akiEngine
-	if dur == target.Durable && (engine == "hot" || engine == "hybrid") {
+	if dur == target.Durable && (engine == "f1raw" || engine == "hot" || engine == "hybrid") {
 		fmt.Fprintf(os.Stderr, "durable mode: %s engine is in-memory only, using btree for a fair durable comparison\n", engine)
 		engine = "btree"
 	}
 
+	// f1raw is the default fast engine and it is served by its own binary, f1srv,
+	// not the aki binary. The legacy engines (btree, hybrid, hot) are served by the
+	// aki binary through its --aki-engine flag. Pick the binary that matches the
+	// engine so launch mode never points the wrong server at the engine name.
+	akiServerBin := *akiBin
+	if engine == "f1raw" {
+		akiServerBin = *f1srvBin
+	}
+
 	specs := []target.Spec{
-		{Kind: target.Aki, Binary: *akiBin, Addr: *akiAddr, Durability: dur, AkiEngine: engine, AkiNet: *akiNet},
+		{Kind: target.Aki, Binary: akiServerBin, Addr: *akiAddr, Durability: dur, AkiEngine: engine, AkiNet: *akiNet},
 		{Kind: target.Redis, Binary: *redisBin, Addr: *redisAddr, Durability: dur},
 		{Kind: target.Valkey, Binary: *valkeyBin, Addr: *valkeyAddr, Durability: dur},
 	}
