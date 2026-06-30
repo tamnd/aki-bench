@@ -47,6 +47,14 @@ type Spec struct {
 	Binary     string     // path or name of the server binary for launch mode
 	Addr       string     // host:port for connect mode; empty means launch
 	Durability Durability // fairness config for launch mode
+
+	// AkiEngine and AkiNet select aki's storage engine and networking model for
+	// the string point path (the -aki-engine and -aki-net server flags). They are
+	// ignored for Redis and Valkey. The defaults are set by the caller: the
+	// harness benchmarks the engine aki is optimized for, not the historical
+	// B-tree, so a baseline never silently measures the wrong path.
+	AkiEngine string
+	AkiNet    string
 }
 
 // Target is a running or reachable server.
@@ -109,7 +117,7 @@ func launch(s Spec) (*Target, error) {
 		return nil, fmt.Errorf("target %s: %w", s.Kind, err)
 	}
 
-	args := launchArgs(s.Kind, port, dataDir, s.Durability)
+	args := launchArgs(s.Kind, port, dataDir, s.Durability, s.AkiEngine, s.AkiNet)
 	cmd := exec.Command(resolved, args...)
 	cmd.Dir = dataDir
 	if err := cmd.Start(); err != nil {
@@ -164,8 +172,10 @@ func defaultBinary(k Kind) string {
 }
 
 // launchArgs builds the command-line flags that put each server in the requested
-// fairness config on the given port and data directory.
-func launchArgs(k Kind, port int, dataDir string, d Durability) []string {
+// fairness config on the given port and data directory. akiEngine and akiNet,
+// when non-empty, select aki's string-path storage engine and networking model;
+// they are ignored for Redis and Valkey.
+func launchArgs(k Kind, port int, dataDir string, d Durability, akiEngine, akiNet string) []string {
 	p := strconv.Itoa(port)
 	switch k {
 	case Aki:
@@ -178,6 +188,12 @@ func launchArgs(k Kind, port int, dataDir string, d Durability) []string {
 			args = append(args, "--appendonly", "yes", "--appendfsync", "always")
 		} else {
 			args = append(args, "--appendonly", "no")
+		}
+		if akiEngine != "" {
+			args = append(args, "--aki-engine", akiEngine)
+		}
+		if akiNet != "" {
+			args = append(args, "--aki-net", akiNet)
 		}
 		return args
 	case Redis, Valkey:
