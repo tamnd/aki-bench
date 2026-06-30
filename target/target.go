@@ -50,9 +50,12 @@ type Spec struct {
 
 	// AkiEngine and AkiNet select aki's storage engine and networking model for
 	// the string point path (the -aki-engine and -aki-net server flags). They are
-	// ignored for Redis and Valkey. The defaults are set by the caller: the
-	// harness benchmarks the engine aki is optimized for, not the historical
-	// B-tree, so a baseline never silently measures the wrong path.
+	// ignored for Redis and Valkey. The default engine is f1raw, the fast
+	// clean-room single-tier engine that is the product; it is served by the f1srv
+	// binary, which accepts the same `server --addr ...` flag shape as the aki
+	// binary so the launch path is identical. The legacy engines (btree, hybrid,
+	// hot) are slower and served by the aki binary; the caller picks the matching
+	// binary so a baseline never silently measures the wrong path.
 	AkiEngine string
 	AkiNet    string
 }
