@@ -106,10 +106,11 @@ On a busy multi-core machine that fight starves the server and understates the r
 The cleanest fix is to run the load generator on a different box through connect mode (`-aki-addr`, `-redis-addr`, `-valkey-addr`).
 
 When only one box is available, `-cpu-split` partitions the cores so the launched server and the load generator never share one.
-On Linux it re-execs the harness under `taskset` pinned to a client core set and launches every server pinned to the disjoint server set, the same way `redis-benchmark --threads N` keeps its load threads off the server.
+On Linux it re-execs the harness under `taskset` pinned to a client core set and launches every server pinned to the disjoint server set, the way `redis-benchmark` keeps its load threads off the server.
 The split is applied identically to aki, Redis, and Valkey, so the comparison stays fair.
-By default the client takes a quarter of the machine (floor of two cores) and the server takes the rest; `-cpu-server` and `-cpu-client` override the two `taskset -c` lists.
-On a 6-core box the default is a 4-core server and a 2-core client, which matches the `redis-benchmark --threads 4` cross check.
+By default the client takes half the machine and the server takes the other half; `-cpu-server` and `-cpu-client` override the two `taskset -c` lists.
+Half, not a quarter: the load generator is a Go client that encodes, decodes, and records a histogram per reply, so it is much heavier than redis-benchmark's C threads, and under-provisioning it makes the client the bottleneck and collapses the measured ratio.
+On a quiet 6-core box the default 3-core server and 3-core client let aki saturate near 0.9M ops/s, where a 2-core client strangled the same run below 0.65M and dragged a real 2x down to 1.3x.
 
 ## Compatibility
 

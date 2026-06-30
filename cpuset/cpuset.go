@@ -25,10 +25,12 @@ import (
 
 // Partition splits numCPU cores into a server set and a client set that do not
 // overlap. The client gets clientCores cores taken from the high end of the
-// range and the server gets the rest from the low end, mirroring a
-// redis-benchmark setup where a handful of load threads sit on the last cores
-// and leave the bulk of the machine to the server. Both returned values are
-// taskset -c lists (for example "0-3" and "4-5").
+// range and the server gets the rest from the low end, so the two sides sit on
+// separate cores the way redis-benchmark keeps its load threads off the server.
+// Unlike redis-benchmark's light C threads, aki-bench's Go client needs a
+// generous share to avoid becoming the bottleneck, so callers usually size
+// clientCores from DefaultClientCores. Both returned values are taskset -c lists
+// (for example "0-2" and "3-5").
 //
 // clientCores is clamped to at least one and to at most numCPU-1 so neither set
 // is ever empty. Partition returns an error only when numCPU is below two, where
@@ -50,13 +52,20 @@ func Partition(numCPU, clientCores int) (server, client string, err error) {
 }
 
 // DefaultClientCores picks how many cores to hand the load generator for a
-// machine of numCPU cores. It gives the client a quarter of the machine, with a
-// floor of two so the load path always has a core to read replies on and a core
-// to spare, and a ceiling that leaves the server the majority of the box. For a
-// 6-core box this is 2, which matches the redis-benchmark --threads 4 cross
-// check that the methodology trusts.
+// machine of numCPU cores. It gives the client half the box, with a floor of two
+// and a ceiling that always leaves the server at least one core.
+//
+// Half, not a quarter: aki-bench's load generator is a Go client that does its
+// own RESP encode, decode, and histogram work per reply, so it is far heavier
+// per operation than redis-benchmark's C threads. A quarter of the box starves
+// it, and a starved client cannot drive the server to saturation, which caps all
+// three targets at the client's ceiling and collapses the measured ratio toward
+// 1.0. On a quiet 6-core box a 3-core client lets aki saturate near 0.9M ops/s
+// while a 2-core client strangles the same run below 0.65M, dragging a real >2x
+// down to 1.3x. So the honest single-box default is a balanced split; the truly
+// clean fix is still a separate client box through connect mode.
 func DefaultClientCores(numCPU int) int {
-	return min(max(numCPU/4, 2), numCPU-1)
+	return min(max(numCPU/2, 2), numCPU-1)
 }
 
 // rangeList renders an inclusive core range as a taskset -c list. A single core
