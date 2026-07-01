@@ -162,6 +162,54 @@ func TestAlgebraPlansBuildTwoSources(t *testing.T) {
 	}
 }
 
+// The set-algebra STORE plans build the same two half-overlapping sources as the read forms
+// and probe a STORE command that names a destination distinct from both sources, so the store
+// takes the non-aliased streaming path. Each probe is four tokens: command, destination, two
+// sources.
+func TestAlgebraStorePlansBuildTwoSources(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+	}{
+		{"sinterstore", "SINTERSTORE"},
+		{"sunionstore", "SUNIONSTORE"},
+		{"sdiffstore", "SDIFFSTORE"},
+	}
+	for _, c := range cases {
+		plan, ok := BuildPlan(c.name, Spec{Members: 256})
+		if !ok {
+			t.Fatalf("%s: BuildPlan returned not-a-plan", c.name)
+		}
+		if plan.PreloadOps != 512 {
+			t.Fatalf("%s: PreloadOps = %d, want 512 (two sets of 256)", c.name, plan.PreloadOps)
+		}
+		sets := map[string]bool{}
+		for seq := int64(0); seq < plan.PreloadOps; seq++ {
+			sets[string(plan.Preload(0, seq)[1])] = true
+		}
+		if len(sets) != 2 {
+			t.Fatalf("%s: preload wrote %d distinct sets, want 2", c.name, len(sets))
+		}
+		probe := plan.Probe(0, 0)
+		if len(probe) != 4 {
+			t.Fatalf("%s: probe has %d args, want 4 (cmd + dest + two sources)", c.name, len(probe))
+		}
+		if string(probe[0]) != c.cmd {
+			t.Fatalf("%s: probe cmd = %q, want %s", c.name, probe[0], c.cmd)
+		}
+		dest := string(probe[1])
+		if sets[dest] {
+			t.Fatalf("%s: destination %q is also a source (store must be non-aliased)", c.name, dest)
+		}
+		if string(probe[2]) == string(probe[3]) {
+			t.Fatalf("%s: probe references the same source twice (%q)", c.name, probe[2])
+		}
+		if !sets[string(probe[2])] || !sets[string(probe[3])] {
+			t.Fatalf("%s: probe sources %q,%q are not the preloaded sets", c.name, probe[2], probe[3])
+		}
+	}
+}
+
 // ZUNIONSTORE builds two equal sorted sets in one pass and unions them into a
 // destination with weights. The preload must cover both source zsets and every
 // member id, and the probe must name both sources plus the WEIGHTS clause without
