@@ -123,15 +123,18 @@ func PlanRegistry() map[string]func(Spec) Plan {
 		"zscore":    ZScore,
 		"zrank":     ZRank,
 	}
+	maps.Copy(reg, hashPlans())
 	maps.Copy(reg, rangePlans())
 	maps.Copy(reg, streamPlans())
 	return reg
 }
 
 // PlanNames lists the collection workloads in a stable order: the point-read
-// plans first, then the range, scan, and algebra plans, then the stream plans.
+// plans first, then the hash operator plans, then the range, scan, and algebra
+// plans, then the stream plans.
 func PlanNames() []string {
-	names := append([]string{"sismember", "hget", "zscore", "zrank"}, rangePlanNames()...)
+	names := append([]string{"sismember", "hget", "zscore", "zrank"}, hashPlanNames()...)
+	names = append(names, rangePlanNames()...)
 	return append(names, streamPlanNames()...)
 }
 
