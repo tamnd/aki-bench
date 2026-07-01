@@ -61,6 +61,11 @@ VAL=$(perl -e "print 'v' x $VALSIZE")
 reset_scope() { systemctl stop ltms.scope 2>/dev/null; systemctl reset-failed ltms.scope 2>/dev/null; sleep 1; }
 drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; }
 wait_up() { local i; for i in $(seq 1 600); do redis-cli -p $PORT ping >/dev/null 2>&1 && return 0; sleep 0.2; done; return 1; }
+# Refuse to start a new engine until the previous one has released the port. A back-to-back
+# rep that races an old server still bound to $PORT sends its load to two servers at once,
+# which double-writes the cold log and halves the measured rate. Block until the port is
+# free so each rep measures exactly one clean engine.
+wait_port_free() { local i; for i in $(seq 1 300); do redis-cli -p $PORT ping >/dev/null 2>&1 || return 0; sleep 0.2; done; return 1; }
 swap_mb() { free -m | awk '/Swap/{print $3}'; }
 rss_of() { local pid=$1; [ -n "$pid" ] && awk '/VmRSS/{printf "%d",$2/1024}' /proc/$pid/status 2>/dev/null; }
 # Pull the rate token right before "requests" in redis-benchmark -q output, so the
@@ -86,7 +91,7 @@ ROWS=(
 # snapshot yet (M2), it keeps the arena resident and reads values from the cold log.
 meas_f1() {
   local load=$1 pr=$2
-  reset_scope; drop_caches; local D; D=$(mktemp -d "$WORKDIR/ltms.XXXXXX")
+  reset_scope; wait_port_free; drop_caches; local D; D=$(mktemp -d "$WORKDIR/ltms.XXXXXX")
   systemd-run --quiet --unit=ltms --scope -p MemoryMax=8G -p MemorySwapMax=8G \
     $F1 server --addr 127.0.0.1:$PORT --dir $D --ltm-cold --sep-threshold $SEP \
     --index-buckets $IBUCKETS --arena-bytes $ARENA >$D/f 2>&1 & local p=$!
@@ -107,7 +112,7 @@ meas_f1() {
 # overflow swaps, drop the file cache, and serve.
 meas_mem() {
   local name=$1 bin=$2 load=$3 pr=$4
-  reset_scope; drop_caches; local D; D=$(mktemp -d "$WORKDIR/ltms.XXXXXX")
+  reset_scope; wait_port_free; drop_caches; local D; D=$(mktemp -d "$WORKDIR/ltms.XXXXXX")
   systemd-run --quiet --unit=ltms --scope -p MemoryMax=8G -p MemorySwapMax=8G \
     $bin --port $PORT --dir $D --save "" --appendonly no >$D/r 2>&1 & local p=$!
   wait_up || { echo "  $name: start-FAIL" >&2; tail -2 $D/r >&2; reset_scope; kill $p 2>/dev/null; rm -rf $D; echo 0; return; }
