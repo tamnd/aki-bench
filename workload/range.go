@@ -183,10 +183,13 @@ func HGetAll(s Spec) Plan {
 	}
 }
 
-// setAKey and setBKey are the two sources the algebra plans build and combine.
+// setAKey and setBKey are the two sources the algebra plans build and combine, and setDest
+// is the separate destination the STORE forms write into (never a source, so the store takes
+// the non-aliased streaming path, which is the common case the audit measures).
 var (
 	setAKey = []byte("set:" + collKey + ":a")
 	setBKey = []byte("set:" + collKey + ":b")
+	setDest = []byte("set:" + collKey + ":out")
 )
 
 // algebraPreload populates two half-overlapping sets over one sequential pass. Even
@@ -275,6 +278,61 @@ func SInterCard(s Spec) Plan {
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return [][]byte{sintercard, two, setAKey, setBKey}
+		},
+	}
+}
+
+// SInterStore builds two half-overlapping sets and probes them with SINTERSTORE into a
+// separate destination, the intersection written out rather than replied. It measures the
+// merge plus the destination write path: the smallest-set-first probe streamed straight into
+// a freshly cleared destination set, O(k) memory for a result of k members. The destination
+// is rebuilt every probe (cleared then rewritten), so the run measures the steady store cost
+// rather than a one-time create.
+func SInterStore(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sinterstore := []byte("SINTERSTORE")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    algebraPreload(sadd, s.Members),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sinterstore, setDest, setAKey, setBKey}
+		},
+	}
+}
+
+// SUnionStore builds two half-overlapping sets and probes them with SUNIONSTORE into a
+// separate destination, the union written out. Unlike the SUNION read, which frames its reply
+// with a two-pass count, the store streams the deduplicated k-way merge straight into the
+// cleared destination in one pass, so it measures the merge plus the destination write with no
+// count pass. The result is about one and a half times Members members, the largest write of
+// the three STORE forms.
+func SUnionStore(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sunionstore := []byte("SUNIONSTORE")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    algebraPreload(sadd, s.Members),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sunionstore, setDest, setAKey, setBKey}
+		},
+	}
+}
+
+// SDiffStore builds two half-overlapping sets and probes them with SDIFFSTORE into a separate
+// destination, the difference written out. About half of set a survives the subtraction, so
+// the probe streams a real walk-and-reject result into the cleared destination rather than a
+// degenerate empty or identity write.
+func SDiffStore(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sdiffstore := []byte("SDIFFSTORE")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    algebraPreload(sadd, s.Members),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sdiffstore, setDest, setAKey, setBKey}
 		},
 	}
 }
@@ -409,10 +467,13 @@ func rangePlans() map[string]func(Spec) Plan {
 		"sunion":        SUnion,
 		"sdiff":         SDiff,
 		"sintercard":    SInterCard,
+		"sinterstore":   SInterStore,
+		"sunionstore":   SUnionStore,
+		"sdiffstore":    SDiffStore,
 	}
 }
 
 // rangePlanNames lists the range, scan, and algebra workloads in a stable order.
 func rangePlanNames() []string {
-	return []string{"lrange", "lpop", "lindex", "zrange", "zrangebyscore", "zunion", "hscan", "sscan", "smembers", "hgetall", "sinter", "sunion", "sdiff", "sintercard"}
+	return []string{"lrange", "lpop", "lindex", "zrange", "zrangebyscore", "zunion", "hscan", "sscan", "smembers", "hgetall", "sinter", "sunion", "sdiff", "sintercard", "sinterstore", "sunionstore", "sdiffstore"}
 }
