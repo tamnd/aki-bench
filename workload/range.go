@@ -189,48 +189,92 @@ var (
 	setBKey = []byte("set:" + collKey + ":b")
 )
 
-// algebraPreload populates two sets over one sequential pass. Even sequence steps
-// write set a, odd steps write set b, and the member id is seq/2 so each set ends
-// with Members distinct members m0..m{Members-1}. The two sets fully overlap, so
-// SINTER returns Members elements and SUNION also returns Members; the probe cost
-// is what we measure, not the cardinality.
-func algebraPreload(sadd []byte) load.CommandGen {
+// algebraPreload populates two half-overlapping sets over one sequential pass. Even
+// sequence steps write set a over m0..m{members-1}, odd steps write set b over the shifted
+// range m{members/2}..m{members+members/2-1}, so each set ends with members distinct members
+// and the two share their upper/lower half band of members/2 members. The overlap scales
+// with the set size so it stays a real middle band at any sweep size, keeping every algebra
+// form doing real work: SINTER and SINTERCARD return about half the members, SDIFF about
+// half, and SUNION about one and a half times members, rather than the degenerate full
+// overlap (SDIFF empty, SINTER is either source) or zero overlap (SINTER empty, SDIFF is the
+// whole first source) a fixed shift would drift into as the size changes.
+func algebraPreload(sadd []byte, members int) load.CommandGen {
+	shift := int64(members / 2)
 	return func(conn int, seq int64) [][]byte {
-		key := setAKey
-		if seq%2 == 1 {
-			key = setBKey
+		if seq%2 == 0 {
+			return [][]byte{sadd, setAKey, memberName(seq / 2)}
 		}
-		return [][]byte{sadd, key, memberName(seq / 2)}
+		return [][]byte{sadd, setBKey, memberName(seq/2 + shift)}
 	}
 }
 
-// SInter builds two equal sets and probes them with SINTER, the streaming
-// k-way-merge intersection the set model specs. PreloadOps is twice Members
-// because the one preload pass fills both sets.
+// SInter builds two half-overlapping sets and probes them with SINTER, the streaming
+// k-way-merge intersection the set model specs. PreloadOps is twice Members because
+// the one preload pass fills both sets; the middle-half overlap means the merge returns
+// a real result rather than a whole source, so the ratio measures the merge, not a copy.
 func SInter(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sinter := []byte("SINTER")
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
-		Preload:    algebraPreload(sadd),
+		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return [][]byte{sinter, setAKey, setBKey}
 		},
 	}
 }
 
-// SUnion builds two equal sets and probes them with SUNION, the streaming union
-// over two sources.
+// SUnion builds two half-overlapping sets and probes them with SUNION, the streaming
+// union over two sources. The middle-half overlap means the two-pass merge dedups a real
+// shared band rather than concatenating two disjoint sets, so it exercises the emit-once
+// path SUNION's framing depends on.
 func SUnion(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sunion := []byte("SUNION")
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
-		Preload:    algebraPreload(sadd),
+		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return [][]byte{sunion, setAKey, setBKey}
+		},
+	}
+}
+
+// SDiff builds two half-overlapping sets and probes them with SDIFF, the streaming
+// difference that walks the first set and rejects any member the second holds. The
+// middle-half overlap means about half of set a survives the subtraction, so the probe
+// measures the real walk-and-reject path rather than the degenerate empty or identity
+// result a full or zero overlap would give.
+func SDiff(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sdiff := []byte("SDIFF")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    algebraPreload(sadd, s.Members),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sdiff, setAKey, setBKey}
+		},
+	}
+}
+
+// SInterCard builds two half-overlapping sets and probes them with SINTERCARD, the
+// count-only intersection that stops at an optional LIMIT. This probe passes no LIMIT, so
+// it counts the whole intersection: the smallest-set-first probe path with no array to
+// frame, the compute-bound cousin of SINTER where aki has no merge-streaming advantage and
+// the audit watches it against Redis's flat hashtable probe.
+func SInterCard(s Spec) Plan {
+	s = s.withDefaults()
+	sadd := []byte("SADD")
+	sintercard := []byte("SINTERCARD")
+	two := []byte("2")
+	return Plan{
+		PreloadOps: int64(s.Members) * 2,
+		Preload:    algebraPreload(sadd, s.Members),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{sintercard, two, setAKey, setBKey}
 		},
 	}
 }
@@ -363,10 +407,12 @@ func rangePlans() map[string]func(Spec) Plan {
 		"hgetall":       HGetAll,
 		"sinter":        SInter,
 		"sunion":        SUnion,
+		"sdiff":         SDiff,
+		"sintercard":    SInterCard,
 	}
 }
 
 // rangePlanNames lists the range, scan, and algebra workloads in a stable order.
 func rangePlanNames() []string {
-	return []string{"lrange", "lpop", "lindex", "zrange", "zrangebyscore", "zunion", "hscan", "sscan", "smembers", "hgetall", "sinter", "sunion"}
+	return []string{"lrange", "lpop", "lindex", "zrange", "zrangebyscore", "zunion", "hscan", "sscan", "smembers", "hgetall", "sinter", "sunion", "sdiff", "sintercard"}
 }

@@ -92,11 +92,13 @@ func TestScanProbesAreBounded(t *testing.T) {
 	}
 }
 
-// The algebra plans build two equal sets in one sequential pass and intersect or
-// union them. The preload must cover both source keys and every member id, and
-// the probe must reference both sources.
+// The algebra plans build two half-overlapping sets in one sequential pass and combine
+// them. The preload must cover both source keys and every member id, each set must end
+// with Members distinct members, and the two must share exactly their half band so every
+// algebra form does real work rather than a degenerate empty or identity result. The read
+// forms (SINTER/SUNION/SDIFF) probe two sources; SINTERCARD prefixes the numkeys count.
 func TestAlgebraPlansBuildTwoSources(t *testing.T) {
-	for _, name := range []string{"sinter", "sunion"} {
+	for _, name := range []string{"sinter", "sunion", "sdiff", "sintercard"} {
 		plan, ok := BuildPlan(name, Spec{Members: 256})
 		if !ok {
 			t.Fatalf("%s: BuildPlan returned not-a-plan", name)
@@ -116,17 +118,46 @@ func TestAlgebraPlansBuildTwoSources(t *testing.T) {
 		if len(keys) != 2 {
 			t.Fatalf("%s: preload wrote %d distinct sets, want 2", name, len(keys))
 		}
+		var setKeys []string
 		for key, members := range keys {
 			if len(members) != 256 {
 				t.Fatalf("%s: set %s has %d members, want 256", name, key, len(members))
 			}
+			setKeys = append(setKeys, key)
 		}
+		// The two sets must share exactly half their members (128 of 256), the middle band
+		// the shifted preload produces, so SINTER/SINTERCARD count 128, SDIFF returns 128,
+		// and SUNION returns 384 rather than a degenerate full or zero overlap.
+		shared := 0
+		for m := range keys[setKeys[0]] {
+			if keys[setKeys[1]][m] {
+				shared++
+			}
+		}
+		if shared != 128 {
+			t.Fatalf("%s: sets share %d members, want 128 (half overlap)", name, shared)
+		}
+
 		probe := plan.Probe(0, 0)
-		if len(probe) != 3 {
-			t.Fatalf("%s: probe has %d args, want 3 (cmd + two sources)", name, len(probe))
-		}
-		if string(probe[1]) == string(probe[2]) {
-			t.Fatalf("%s: probe references the same source twice (%q)", name, probe[1])
+		switch name {
+		case "sintercard":
+			// SINTERCARD numkeys key key: four tokens, numkeys is 2, two distinct sources.
+			if len(probe) != 4 {
+				t.Fatalf("%s: probe has %d args, want 4 (cmd + numkeys + two sources)", name, len(probe))
+			}
+			if string(probe[1]) != "2" {
+				t.Fatalf("%s: numkeys = %q, want 2", name, probe[1])
+			}
+			if string(probe[2]) == string(probe[3]) {
+				t.Fatalf("%s: probe references the same source twice (%q)", name, probe[2])
+			}
+		default:
+			if len(probe) != 3 {
+				t.Fatalf("%s: probe has %d args, want 3 (cmd + two sources)", name, len(probe))
+			}
+			if string(probe[1]) == string(probe[2]) {
+				t.Fatalf("%s: probe references the same source twice (%q)", name, probe[1])
+			}
 		}
 	}
 }
