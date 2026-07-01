@@ -23,6 +23,19 @@
 # This run is uniform-random. Zipfian (skew) is a separate row set the spec calls
 # for to show the hot-tier win; it is NOT measured here and is logged as a gap, not
 # silently dropped.
+#
+# The recipe is point reads by design, one per type: SISMEMBER, ZSCORE, ZRANK,
+# HGET, LINDEX. redis-benchmark's __rand_int__ substitutes a random 12-digit id
+# into a fixed template, which fits a point lookup exactly and a range or algebra
+# shape poorly: a windowed read needs a computed pair (start, start+window) and
+# __rand_int__ can only drop independent randoms, so ZRANGE r1 r2 lands empty
+# whenever r1>r2; an algebra like SINTER needs a second loaded collection, which
+# doubles the dataset and breaks the single-collection cap math this fairness rule
+# depends on. Forcing those shapes here would measure a degenerate probe, not the
+# serve-time win. The bounded range, scan, and algebra shapes are exercised in the
+# in-memory-fit scenario instead, which drives aki-bench's plan probes rather than
+# redis-benchmark; carrying them into the capped LTM regime needs a probe generator
+# that can compute a window, and that is a logged follow-up, not a silent drop.
 set -u
 
 CAP=${CAP:-300M}        # RAM cap the read phase serves under
@@ -60,6 +73,7 @@ ROWS=(
   "zscore|zset|for(0..$N-1){printf \"ZADD z:0 %d %012d${PAD}\n\",\$_,\$_}|zcard z:0|ZSCORE z:0 __rand_int__${PAD}"
   "zrank|zset|for(0..$N-1){printf \"ZADD z:0 %d %012d${PAD}\n\",\$_,\$_}|zcard z:0|ZRANK z:0 __rand_int__${PAD}"
   "hget|hash|for(0..$N-1){printf \"HSET h:0 %012d${PAD} ${VAL}\n\",\$_}|hlen h:0|HGET h:0 __rand_int__${PAD}"
+  "lindex|list|for(0..$N-1){printf \"RPUSH l:0 %012d${PAD}\n\",\$_}|llen l:0|LINDEX l:0 __rand_int__"
 )
 
 load_pipe() { perl -e "$1" | redis-cli -p $PORT --pipe >/dev/null 2>&1; }

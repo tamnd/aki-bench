@@ -20,9 +20,22 @@ rows:
 | zscore    | zset | `ZADD z:0 ...`| `ZSCORE z:0 <rand>`         |
 | zrank     | zset | `ZADD z:0 ...`| `ZRANK z:0 <rand>`          |
 | hget      | hash | `HSET h:0 ...`| `HGET h:0 <rand>`           |
+| lindex    | list | `RPUSH l:0 ...`| `LINDEX l:0 <rand>`        |
 
 The probe element is `__rand_int__` plus the pad, so redis-benchmark's 12-digit
-random substitution lands on a stored element every time.
+random substitution lands on a stored element every time. LINDEX substitutes the
+random straight into the index, so `<rand>` in `[0, N)` is always a valid position
+in the `N`-element list.
+
+Each row is one point read, one per type. That is the shape redis-benchmark's
+`__rand_int__` template fits: a single random id dropped into a fixed command. A
+bounded range or scan needs a computed window (`start, start+window`) and the
+template can only drop independent randoms, so `ZRANGE z:0 r1 r2` lands empty
+whenever `r1 > r2`; an algebra like `SINTER` needs a second loaded collection,
+which doubles the dataset and breaks the single-collection cap math the fairness
+rule depends on. Those shapes are exercised in the in-memory-fit scenario, which
+drives aki-bench's plan probes; carrying them into the capped LTM regime needs a
+probe generator that can compute a window, which is a logged follow-up.
 
 ## The fairness rule
 
@@ -87,6 +100,9 @@ set and the fault rate are roughly double a single-descent read. Valkey's skipli
 rank stays a single logarithmic walk even when swapped, so it holds up. ZRANK is
 therefore a still-slow site under the standing rule and is tracked as the next LTM
 optimization; the goal stays open until it clears 2x against both engines.
+
+The `lindex` list row was added after this run, so it is not in the table above; it
+lands in the next baseline sweep.
 
 ## Scope
 
