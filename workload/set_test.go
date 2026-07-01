@@ -14,6 +14,9 @@ func TestSetPlansBuildAndProbe(t *testing.T) {
 		{"smismember", "SMISMEMBER"},
 		{"saddmember", "SADD"},
 		{"srem", "SREM"},
+		{"srandmember", "SRANDMEMBER"},
+		{"srandmembercount", "SRANDMEMBER"},
+		{"spop", "SPOP"},
 	}
 	for _, c := range cases {
 		plan, ok := BuildPlan(c.name, Spec{Members: 1000})
@@ -93,6 +96,39 @@ func TestSetMIsMemberWindow(t *testing.T) {
 	sp := small.Probe(0, 0)
 	if got := len(sp) - 2; got != 10 {
 		t.Fatalf("SMISMEMBER on a 10-member set requested %d members, want 10", got)
+	}
+}
+
+// The no-count random reads probe the set key with a bare command and no member
+// argument, so the server picks the member: this is the O(log n) random-seek path the
+// audit measures, not a client-chosen point probe.
+func TestSetRandomNoArgProbe(t *testing.T) {
+	for _, name := range []string{"srandmember", "spop"} {
+		plan, _ := BuildPlan(name, Spec{Members: 1000})
+		probe := plan.Probe(0, 0)
+		if len(probe) != 2 {
+			t.Fatalf("%s: probe has %d tokens, want 2 (cmd + key)", name, len(probe))
+		}
+	}
+}
+
+// The count-form SRANDMEMBER requests a positive window sized to the range window and
+// clamped to the member space, so it exercises the distinct sampler over a bounded batch.
+func TestSetRandMemberCountWindow(t *testing.T) {
+	plan, _ := BuildPlan("srandmembercount", Spec{Members: 1000})
+	probe := plan.Probe(0, 0)
+	// SRANDMEMBER key count : three tokens, the count is the range window.
+	if len(probe) != 3 {
+		t.Fatalf("SRANDMEMBER count probe has %d tokens, want 3", len(probe))
+	}
+	if got := string(probe[2]); got != "100" {
+		t.Fatalf("count = %q, want the range window 100", got)
+	}
+	// A set smaller than the window clamps the count to the member count, so the request
+	// never asks for more distinct members than exist.
+	small, _ := BuildPlan("srandmembercount", Spec{Members: 10})
+	if got := string(small.Probe(0, 0)[2]); got != "10" {
+		t.Fatalf("count on a 10-member set = %q, want 10", got)
 	}
 }
 

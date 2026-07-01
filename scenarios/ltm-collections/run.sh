@@ -70,6 +70,7 @@ rate() { tr '\r' '\n' | awk '{for(i=1;i<=NF;i++)if($i=="requests")v=$(i-1)} END{
 # $N and $PAD and $VAL at eval time.
 ROWS=(
   "sismember|set|for(0..$N-1){printf \"SADD s:0 %012d${PAD}\n\",\$_}|scard s:0|SISMEMBER s:0 __rand_int__${PAD}"
+  "srandmember|set|for(0..$N-1){printf \"SADD s:0 %012d${PAD}\n\",\$_}|scard s:0|SRANDMEMBER s:0"
   "zscore|zset|for(0..$N-1){printf \"ZADD z:0 %d %012d${PAD}\n\",\$_,\$_}|zcard z:0|ZSCORE z:0 __rand_int__${PAD}"
   "zrank|zset|for(0..$N-1){printf \"ZADD z:0 %d %012d${PAD}\n\",\$_,\$_}|zcard z:0|ZRANK z:0 __rand_int__${PAD}"
   "hget|hash|for(0..$N-1){printf \"HSET h:0 %012d${PAD} ${VAL}\n\",\$_}|hlen h:0|HGET h:0 __rand_int__${PAD}"
