@@ -17,6 +17,7 @@ func TestSetPlansBuildAndProbe(t *testing.T) {
 		{"srandmember", "SRANDMEMBER"},
 		{"srandmembercount", "SRANDMEMBER"},
 		{"spop", "SPOP"},
+		{"smove", "SMOVE"},
 	}
 	for _, c := range cases {
 		plan, ok := BuildPlan(c.name, Spec{Members: 1000})
@@ -129,6 +130,26 @@ func TestSetRandMemberCountWindow(t *testing.T) {
 	small, _ := BuildPlan("srandmembercount", Spec{Members: 10})
 	if got := string(small.Probe(0, 0)[2]); got != "10" {
 		t.Fatalf("count on a 10-member set = %q, want 10", got)
+	}
+}
+
+// SMOVE probes SMOVE source destination member: four tokens, the source is the shared
+// set key, the destination is a distinct sibling set (never the source, so the move is
+// a real two-key move and not a same-set no-op), and the member is a live member name.
+func TestSetMoveProbeShape(t *testing.T) {
+	plan, _ := BuildPlan("smove", Spec{Members: 1000})
+	probe := plan.Probe(0, 0)
+	if len(probe) != 4 {
+		t.Fatalf("SMOVE probe has %d tokens, want 4 (cmd + source + dest + member)", len(probe))
+	}
+	if string(probe[1]) != "set:"+collKey {
+		t.Fatalf("SMOVE source = %q, want the shared set key", probe[1])
+	}
+	if string(probe[2]) == string(probe[1]) {
+		t.Fatalf("SMOVE destination %q equals the source, want a distinct sibling set", probe[2])
+	}
+	if probe[3][0] != 'm' {
+		t.Fatalf("SMOVE member token %q is not a set member name", probe[3])
 	}
 }
 

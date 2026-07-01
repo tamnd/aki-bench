@@ -169,6 +169,30 @@ func SPop(s Spec) Plan {
 	}
 }
 
+// SMove builds a set of Members members and probes it with SMOVE of a random member
+// from setProbeKey into a sibling destination set, the two-key atomic move. It is the
+// first set write that touches two collections at once, so it exercises the two-stripe
+// lock the point path never needed (spec 2064/f1_rewrite_ltm/06 section 8.9): remove one
+// member row from the source sub-tree and add it to the destination sub-tree while both
+// header counts stay in step. Like SREM it drains the source over a sustained run, one
+// member per probe; once a member has moved, re-moving it returns 0 on the same cheap
+// not-in-source path across aki, Redis, and Valkey, so a drained tail does not bias the
+// ratio. The destination grows to mirror the source, so it measures the populated move
+// cost throughout rather than a create-empty artifact.
+func SMove(s Spec) Plan {
+	s = s.withDefaults()
+	sel := s.memberSelector()
+	smove := []byte("SMOVE")
+	dstKey := []byte("set:" + collKey + ":moved")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload:    setPreload(),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{smove, setProbeKey, dstKey, memberName(sel(seq))}
+		},
+	}
+}
+
 // setPlans returns the set operator plans this file adds, keyed by name. They merge
 // into PlanRegistry so main dispatches them the same way as the other collection plans.
 func setPlans() map[string]func(Spec) Plan {
@@ -180,10 +204,11 @@ func setPlans() map[string]func(Spec) Plan {
 		"srandmember":      SRandMember,
 		"srandmembercount": SRandMemberCount,
 		"spop":             SPop,
+		"smove":            SMove,
 	}
 }
 
 // setPlanNames lists the set operator workloads in a stable order.
 func setPlanNames() []string {
-	return []string{"scard", "smismember", "saddmember", "srem", "srandmember", "srandmembercount", "spop"}
+	return []string{"scard", "smismember", "saddmember", "srem", "srandmember", "srandmembercount", "spop", "smove"}
 }
