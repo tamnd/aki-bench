@@ -43,16 +43,18 @@ F1SRV_BIN=${F1SRV_BIN:-f1srv}             # serves the f1raw product engine (str
 REDIS_BIN=${REDIS_BIN:-redis-server}
 VALKEY_BIN=${VALKEY_BIN:-valkey-server}
 
-# Each row is "engine|type|workload workload ...". The string row runs on the
-# f1raw product engine; the collection rows run on the btree legacy engine until
-# the collection types are built on f1raw (M4-M8). The name is ROWS, not GROUPS:
-# GROUPS is a special bash array holding the caller's group ids, and assigning to
-# it is silently ignored, so the matrix would expand to the user's gid list.
+# Each row is "engine|type|workload workload ...". String, hash, set, and zset now
+# run on the f1raw product engine: their point, enumeration, and algebra paths are
+# built on f1raw (milestones M4-M6, served by f1srv). List and stream are not yet on
+# f1raw, so they run on the btree legacy engine until M7-M8 land; the engine per row
+# is printed so the split stays explicit. The name is ROWS, not GROUPS: GROUPS is a
+# special bash array holding the caller's group ids, and assigning to it is silently
+# ignored, so the matrix would expand to the user's gid list.
 ROWS=(
   "f1raw|string|set get incr getrange"
-  "btree|hash|hset hget hscan hgetall"
-  "btree|set|sadd sismember sscan sinter"
-  "btree|zset|zadd zscore zrange zrank zunion"
+  "f1raw|hash|hset hget hscan hgetall"
+  "f1raw|set|sadd sismember sscan sinter"
+  "f1raw|zset|zadd zscore zrange zrank zunion"
   "btree|list|lpush lrange lpop lindex"
   "btree|stream|xadd xrange xread xreadgroup"
 )
@@ -61,7 +63,7 @@ PIPES=(${PIPES:-1 16})
 DISTS=(${DISTS:-uniform zipfian})
 
 echo "== IN-MEMORY-FIT full-type matrix: $MEMBERS elements, no cap, warm =="
-echo "== gate=${GATE}x over both Redis and Valkey; strings on f1raw (product), collections on btree (legacy) until M4-M8 =="
+echo "== gate=${GATE}x over both Redis and Valkey; string/hash/set/zset on f1raw (product), list/stream on btree (legacy) until M7-M8 =="
 echo "== uniform is the hot tier's worst case, zipfian its best; most cells miss the bar today and that is expected =="
 
 fail=0
