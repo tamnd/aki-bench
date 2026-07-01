@@ -125,6 +125,7 @@ func PlanRegistry() map[string]func(Spec) Plan {
 	}
 	maps.Copy(reg, hashPlans())
 	maps.Copy(reg, setPlans())
+	maps.Copy(reg, zsetPlans())
 	maps.Copy(reg, rangePlans())
 	maps.Copy(reg, streamPlans())
 	return reg
@@ -136,6 +137,7 @@ func PlanRegistry() map[string]func(Spec) Plan {
 func PlanNames() []string {
 	names := append([]string{"sismember", "hget", "zscore", "zrank"}, hashPlanNames()...)
 	names = append(names, setPlanNames()...)
+	names = append(names, zsetPlanNames()...)
 	names = append(names, rangePlanNames()...)
 	return append(names, streamPlanNames()...)
 }
