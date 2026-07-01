@@ -113,18 +113,77 @@ func SRem(s Spec) Plan {
 	}
 }
 
+// SRandMember builds a set of Members members and probes it with the no-count
+// SRANDMEMBER, one uniform random member off the ordered index. This is the read the
+// audit points at (spec 2064/f1_rewrite_ltm/06 section 10.1): a per-member storage model
+// must answer a random member with an O(log n) order-statistic seek, never an O(n) count,
+// so on a multi-million member set aki stays flat while a model that counts to a random
+// offset falls behind. It is non-destructive, so the set stays fully populated for the run.
+func SRandMember(s Spec) Plan {
+	s = s.withDefaults()
+	srandmember := []byte("SRANDMEMBER")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload:    setPreload(),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{srandmember, setProbeKey}
+		},
+	}
+}
+
+// SRandMemberCount builds a set of Members members and probes it with the positive-count
+// SRANDMEMBER over a window, the distinct-sample form. Each probe draws rangeWindow
+// distinct members with no duplicates, so it exercises the uniform-without-replacement
+// sampler: a window of O(log n) seeks below the half-cardinality crossover, which is the
+// bounded-batch cost a random-sample model must keep flat as the set grows. It is
+// non-destructive, so the set stays full for the whole run.
+func SRandMemberCount(s Spec) Plan {
+	s = s.withDefaults()
+	srandmember := []byte("SRANDMEMBER")
+	cnt := intArg(min(int64(s.Members), int64(rangeWindow)))
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload:    setPreload(),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{srandmember, setProbeKey, cnt}
+		},
+	}
+}
+
+// SPop builds a set of Members members and probes it with the no-count SPOP, the
+// destructive random draw. Like SRem it drains the set over a sustained run, one member
+// per probe: it seeks a uniform random member off the ordered index, returns it, and
+// removes it, so it measures the random-select-and-remove path a model must keep O(log n)
+// on both sides rather than counting to the drawn offset. Size Members at or above the op
+// budget so a live member is popped throughout; once drained, SPOP returns nil on the same
+// cheap empty path across aki, Redis, and Valkey.
+func SPop(s Spec) Plan {
+	s = s.withDefaults()
+	spop := []byte("SPOP")
+	return Plan{
+		PreloadOps: int64(s.Members),
+		Preload:    setPreload(),
+		Probe: func(conn int, seq int64) [][]byte {
+			return [][]byte{spop, setProbeKey}
+		},
+	}
+}
+
 // setPlans returns the set operator plans this file adds, keyed by name. They merge
 // into PlanRegistry so main dispatches them the same way as the other collection plans.
 func setPlans() map[string]func(Spec) Plan {
 	return map[string]func(Spec) Plan{
-		"scard":      SCard,
-		"smismember": SMIsMember,
-		"saddmember": SAddMember,
-		"srem":       SRem,
+		"scard":            SCard,
+		"smismember":       SMIsMember,
+		"saddmember":       SAddMember,
+		"srem":             SRem,
+		"srandmember":      SRandMember,
+		"srandmembercount": SRandMemberCount,
+		"spop":             SPop,
 	}
 }
 
 // setPlanNames lists the set operator workloads in a stable order.
 func setPlanNames() []string {
-	return []string{"scard", "smismember", "saddmember", "srem"}
+	return []string{"scard", "smismember", "saddmember", "srem", "srandmember", "srandmembercount", "spop"}
 }
