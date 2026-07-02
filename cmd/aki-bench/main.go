@@ -176,6 +176,18 @@ func run(args []string) error {
 		if !ok {
 			return report.Skipped(name, *wl)
 		}
+		// Start every target from an identical empty keyspace. When aki-bench
+		// launches its own servers they are already empty, but when it connects to a
+		// persistent reference (a redis or valkey left running across runs via
+		// -redis-addr/-valkey-addr) that server still holds the previous run's keys.
+		// A hgetall run that preloads a 100-field hash onto a reference that already
+		// holds a 100k-field hash from a prior sweep then measures aki against a hash
+		// two orders larger, a silent apples-to-oranges comparison. Flushing first
+		// makes the preload authoritative for the shape every target is measured on.
+		if err := flushTarget(t.Addr); err != nil {
+			fmt.Fprintf(os.Stderr, "flush %s: %v\n", k, err)
+			return report.Skipped(name, *wl)
+		}
 		// For a collection plan, build the probed collection first. The preload
 		// runs on one connection so a single sequence 0..PreloadOps-1 populates
 		// every member exactly once; a multi-connection preload would restart the
@@ -271,6 +283,26 @@ const cpuServerEnv = "AKIBENCH_CPU_SERVER"
 // client half; that re-exec does not return on success. On the pinned pass it
 // reads the server half back and returns it. A pin failure degrades to an
 // unpinned run rather than aborting.
+// flushTarget clears a target's keyspace with a single FLUSHALL, so every run
+// starts from the same empty state whether the server was just launched or is a
+// persistent reference carrying a prior run's keys. It opens one short-lived
+// connection, sends the command, and waits for the reply so the flush is complete
+// before preload begins.
+func flushTarget(addr string) error {
+	cl, err := load.Dial(addr, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+	if err := cl.WriteCommand([][]byte{[]byte("FLUSHALL")}); err != nil {
+		return err
+	}
+	if err := cl.Flush(); err != nil {
+		return err
+	}
+	return cl.ReadReply()
+}
+
 func applyCPUSplit(enabled bool, serverList, clientList string, launching bool) string {
 	if !enabled || !launching || !cpuset.Available() {
 		return ""
