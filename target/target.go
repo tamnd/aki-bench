@@ -7,6 +7,7 @@
 package target
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -108,6 +109,14 @@ func Provide(s Spec) (*Target, error) {
 	return launch(s)
 }
 
+// launchAttempts is how many times launch tries to bring a server up before it
+// gives up. A single try is fragile on a busy multi-cell sweep: a transient load
+// spike or a brief memory-pressure window can push one server's startup past the
+// reachability deadline, and one such miss would abort the whole matrix. A second
+// attempt on a fresh port and data directory rides through the blip; a real
+// misconfiguration still fails both times and surfaces the captured startup log.
+const launchAttempts = 2
+
 func launch(s Spec) (*Target, error) {
 	bin := s.Binary
 	if bin == "" {
@@ -118,6 +127,22 @@ func launch(s Spec) (*Target, error) {
 		return nil, &SkipError{Kind: s.Kind, Reason: bin + " not found on PATH"}
 	}
 
+	var lastErr error
+	for attempt := 1; attempt <= launchAttempts; attempt++ {
+		t, err := launchOnce(s, resolved)
+		if err == nil {
+			return t, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// launchOnce makes one attempt to spawn and reach a server. On a reachability
+// failure it includes the tail of the child's own startup output in the error, so
+// a real failure (a rejected data file, a bad flag, an OOM kill) is diagnosable
+// instead of a bare "connection refused". Startup output is otherwise discarded.
+func launchOnce(s Spec, resolved string) (*Target, error) {
 	port, err := freePort()
 	if err != nil {
 		return nil, fmt.Errorf("target %s: %w", s.Kind, err)
@@ -133,6 +158,12 @@ func launch(s Spec) (*Target, error) {
 	runBin, runArgs := cpuset.ServerWrap(s.CPUList, resolved, args)
 	cmd := exec.Command(runBin, runArgs...)
 	cmd.Dir = dataDir
+	// Capture the child's startup output so a failed launch can report why. The
+	// buffer is only read on the error path, and startup output is a few short
+	// lines, so an unbounded buffer here holds at most a screenful.
+	var startup bytes.Buffer
+	cmd.Stdout = &startup
+	cmd.Stderr = &startup
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(dataDir)
 		return nil, fmt.Errorf("target %s: start: %w", s.Kind, err)
@@ -142,10 +173,24 @@ func launch(s Spec) (*Target, error) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		_ = os.RemoveAll(dataDir)
-		return nil, fmt.Errorf("target %s: did not come up on %s: %w", s.Kind, addr, err)
+		return nil, fmt.Errorf("target %s: did not come up on %s: %w%s", s.Kind, addr, err, startupTail(&startup))
 	}
 
 	return &Target{Kind: s.Kind, Addr: addr, cmd: cmd, dataDir: dataDir}, nil
+}
+
+// startupTail renders the last few lines of a failed server's startup output for
+// inclusion in an error, or an empty string when the child printed nothing.
+func startupTail(buf *bytes.Buffer) string {
+	const max = 512
+	b := buf.Bytes()
+	if len(b) == 0 {
+		return ""
+	}
+	if len(b) > max {
+		b = b[len(b)-max:]
+	}
+	return "\nstartup output:\n" + string(bytes.TrimRight(b, "\n"))
 }
 
 // Close stops a launched server and removes its data directory. It is a no-op
