@@ -71,7 +71,7 @@ func run(args []string) error {
 		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product) or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
 		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
 
-		cpuSplit  = fs.Bool("cpu-split", false, "partition cores so the launched server and the load generator never share a core (Linux launch mode); removes the co-located-client starvation that understates the ratio")
+		cpuSplit  = fs.Bool("cpu-split", true, "partition cores so the launched server and the load generator never share a core (Linux launch mode, on by default); removes the co-located-client starvation that understates the ratio; pass -cpu-split=false to co-locate")
 		cpuServer = fs.String("cpu-server", "", "taskset -c list for the server half of -cpu-split, for example 0-3; empty auto-derives from the core count")
 		cpuClient = fs.String("cpu-client", "", "taskset -c list for the load-generator half of -cpu-split, for example 4-5; empty auto-derives from the core count")
 	)
