@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +23,44 @@ import (
 	"github.com/tamnd/aki-bench/target"
 	"github.com/tamnd/aki-bench/workload"
 )
+
+// defaultClientGOGC is the GC target the load generator runs itself at unless the
+// operator overrides it. This is not a server tuning knob: it tunes the benchmark
+// client, which is a Go process, and under the runtime default of 100 that process
+// becomes the bottleneck on the very workloads it is supposed to measure. At P16
+// pipeline the windowed range and scan replies (LRANGE, ZRANGE, HSCAN) land tens
+// of thousands of reply buffers per second in the client, the collector fires
+// often enough to draft the reading goroutines into GC assist, and the client
+// caps out below what the server can serve while its own p99 balloons. That stall
+// silently penalizes the fastest target: it under-reports aki's throughput and
+// inflates aki's tail, while a server-bound target like Redis (~350k ops/sec,
+// well under the client ceiling) is untouched, so the same run measures the two
+// on different instruments. The fix is to keep the measuring instrument off the
+// critical path. With the client held here the same manually launched servers
+// report aki at its true rate (a 200k-member LRANGE P16 cell moves from a
+// client-limited 2.5x with a p99 tail regression to a server-limited 3.5x with no
+// regression), and Redis and Valkey do not move because they were never
+// client-limited. 2000 matches the f1srv server default and leaves ample headroom
+// over the bounded reply buffers a bench run allocates, so there is no OOM risk
+// across the short measured window.
+const defaultClientGOGC = 2000
+
+// tuneClientGC raises the load generator's own GC target so the benchmark client
+// never becomes the bottleneck it is trying to measure. An explicit GOGC in the
+// environment wins (the runtime already honored it at startup and an operator who
+// set it means it), and an explicit -client-gogc on the command line wins over
+// both. It returns the effective target for the startup banner. See
+// defaultClientGOGC for why this is a correctness fix, not a thumb on the scale.
+func tuneClientGC(flagVal int, flagExplicit bool) int {
+	if envVal, envSet := os.LookupEnv("GOGC"); envSet && !flagExplicit {
+		if n, err := strconv.Atoi(envVal); err == nil {
+			return n
+		}
+		return flagVal
+	}
+	debug.SetGCPercent(flagVal)
+	return flagVal
+}
 
 // errGateNotMet signals that the run completed but the 2x speedup gate failed.
 // It maps to exit code 2. It is returned rather than calling os.Exit inside run
@@ -74,10 +114,24 @@ func run(args []string) error {
 		cpuSplit  = fs.Bool("cpu-split", true, "partition cores so the launched server and the load generator never share a core (Linux launch mode, on by default); removes the co-located-client starvation that understates the ratio; pass -cpu-split=false to co-locate")
 		cpuServer = fs.String("cpu-server", "", "taskset -c list for the server half of -cpu-split, for example 0-3; empty auto-derives from the core count")
 		cpuClient = fs.String("cpu-client", "", "taskset -c list for the load-generator half of -cpu-split, for example 4-5; empty auto-derives from the core count")
+
+		clientGOGC = fs.Int("client-gogc", defaultClientGOGC, "GC target for this load generator so the measuring client never becomes the bottleneck (see the range/scan rationale in code); an explicit GOGC in the environment wins")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+
+	// Tune the client's own GC before any work so the measuring instrument stays
+	// off the critical path. This must happen before preload and the measured run,
+	// which is where the client's allocation pressure lives.
+	clientGOGCExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "client-gogc" {
+			clientGOGCExplicit = true
+		}
+	})
+	effClientGOGC := tuneClientGC(*clientGOGC, clientGOGCExplicit)
+	fmt.Fprintf(os.Stderr, "aki-bench: load-generator gogc=%d\n", effClientGOGC)
 
 	duration, err := time.ParseDuration(*durationStr)
 	if err != nil {
