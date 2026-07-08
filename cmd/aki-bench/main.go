@@ -237,12 +237,21 @@ func run(args []string) error {
 			TargetRate:  *targetRate,
 			Gen:         probe,
 		}
+		// Probe the live server's self-reported version before the load so the
+		// report records the exact build measured, not the binary name on PATH.
+		// A failed probe is not fatal: it just leaves the version blank.
+		var version string
+		if info, perr := load.ProbeServer(t.Addr, 2*time.Second); perr == nil {
+			version = info.String()
+		} else {
+			fmt.Fprintf(os.Stderr, "version probe %s: %v\n", k, perr)
+		}
 		res, err := load.Run(context.Background(), cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "run %s: %v\n", k, err)
-			return report.Skipped(name, *wl)
+			return report.Skipped(name, *wl).WithVersion(version)
 		}
-		return report.FromResult(name, *wl, res)
+		return report.FromResult(name, *wl, res).WithVersion(version)
 	}
 
 	cmp := report.NewComparison(*wl,

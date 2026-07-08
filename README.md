@@ -3,8 +3,11 @@
 Benchmarks for [aki](https://github.com/tamnd/aki) against Redis and Valkey.
 
 aki is a Redis-wire-compatible single-file database.
-Its stated goal is to be at least twice as fast as Redis 7.4 and Valkey on equivalent hardware.
+Its stated goal is to be at least twice as fast as the current Redis and Valkey on equivalent hardware, which today means Redis 8.8 and Valkey 9.1, and to do it while holding a dataset larger than memory in one file.
 This repository is the harness that proves or disproves that claim, and it ships the exact pass/fail gate the claim is measured against.
+
+The harness is version-agnostic by design: it runs whatever `redis-server` and `valkey-server` it finds on PATH, and it probes each one with `INFO server` before the load so the report records the exact version it measured.
+That closes the trap of benching an old build and labeling it the current target.
 
 It is a tooling repo, so it uses third-party Go deps where they earn their place, but in practice the load generator, the RESP client, and the latency histogram are all native and zero-dependency.
 
