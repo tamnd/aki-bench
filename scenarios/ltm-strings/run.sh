@@ -19,9 +19,13 @@
 # cap and serves values from the cold log through the OS page cache, which the cap
 # bounds. Redis and Valkey overflow their heap to swap under the same cap.
 #
-# Keys are 12-digit zero-padded ids, which is exactly what redis-benchmark's
-# __rand_int__ substitutes, so every GET probe hits a stored key and measures the value
-# fetch rather than a miss. Values are VALSIZE bytes (default 1024), above the default
+# Keys are k:<id> for id in 0..N-1, which is what memtier generates from
+# --key-prefix=k: over --key-minimum=1 --key-maximum=N-1. memtier rejects a key-minimum
+# of zero, so the probe draws over k:1..k:N-1; the one unprobed key out of N is well
+# under noise and every drawn key is a guaranteed hit that measures the value fetch
+# rather than a miss. The load streams the same k:<id> keys through redis-cli --pipe, so
+# load and probe share one key generator with no zero-pad template to keep in sync.
+# Values are VALSIZE bytes (default 1024), above the default
 # 512-byte separation threshold, so every value is separated on f1srv. N keys x VALSIZE
 # is the raw value volume; pick CAP well under it so the rivals must swap.
 #
@@ -34,8 +38,9 @@ SWAP=${SWAP:-4096M}     # swap room the rivals fault into
 N=${N:-1000000}         # string keys (N x VALSIZE is the raw value volume)
 VALSIZE=${VALSIZE:-1024} # value bytes; must exceed the f1srv separation threshold
 PORT=${PORT:-7048}
-GETN=${GETN:-100000}    # random probes per measurement
+PTIME=${PTIME:-10}      # seconds per measured probe (memtier --test-time)
 CLIENTS=${CLIENTS:-50}
+THREADS=${THREADS:-4}   # memtier client threads
 PIPE=${PIPE:-16}
 REPS=${REPS:-2}
 SEP=${SEP:-512}         # f1srv separation threshold in bytes
@@ -56,7 +61,6 @@ if [ "$(stat -f -c %T "$WORKDIR" 2>/dev/null)" = tmpfs ]; then
   echo "WORKDIR=$WORKDIR is tmpfs (RAM-backed); the cold log would defeat the LTM test. Set WORKDIR to a real-disk path." >&2
   exit 1
 fi
-VAL=$(perl -e "print 'v' x $VALSIZE")
 
 reset_scope() { systemctl stop ltms.scope 2>/dev/null; systemctl reset-failed ltms.scope 2>/dev/null; sleep 1; }
 drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; }
@@ -68,22 +72,30 @@ wait_up() { local i; for i in $(seq 1 600); do redis-cli -p $PORT ping >/dev/nul
 wait_port_free() { local i; for i in $(seq 1 300); do redis-cli -p $PORT ping >/dev/null 2>&1 || return 0; sleep 0.2; done; return 1; }
 swap_mb() { free -m | awk '/Swap/{print $3}'; }
 rss_of() { local pid=$1; [ -n "$pid" ] && awk '/VmRSS/{printf "%d",$2/1024}' /proc/$pid/status 2>/dev/null; }
-# Pull the rate token right before "requests" in redis-benchmark -q output, so the
-# probe command's own arguments never shift a fixed column.
-rate() { tr '\r' '\n' | awk '{for(i=1;i<=NF;i++)if($i=="requests")v=$(i-1)} END{print v+0}'; }
 
 load_pipe() { perl -e "$1" | redis-cli -p $PORT --pipe >/dev/null 2>&1; }
-probe() { redis-benchmark -p $PORT -r $N -n $GETN -c $CLIENTS -P $PIPE -q $1 2>/dev/null | rate; }
+# Probe with memtier over the loaded keyspace. $1 is the op (GET or SET); memtier builds
+# k:<id> keys from --key-prefix=k: over the same 0..N-1 range the load filled, so a GET
+# is a guaranteed hit and a SET overwrites in place. --command-key-pattern=R draws ids
+# uniformly at random, the same shape redis-benchmark -r gave. The rate is the single
+# Totals ops/sec line memtier prints.
+probe() {
+  local cmd; [ "$1" = GET ] && cmd="GET __key__" || cmd="SET __key__ __data__"
+  memtier_benchmark -p $PORT --command="$cmd" --command-key-pattern=R \
+    --key-prefix=k: --key-minimum=1 --key-maximum=$((N-1)) --data-size $VALSIZE \
+    -c $CLIENTS -t $THREADS --pipeline $PIPE --test-time $PTIME --hide-histogram \
+    --distinct-client-seed 2>/dev/null | awk '/Totals/{printf "%.0f",$2;exit}'
+}
 
-# The row table. Each row is: name | load-perl | probe redis-benchmark args.
+# The row table. Each row is: name | load-perl | probe op (GET or SET).
 # load-perl prints inline commands to stream through redis-cli --pipe. $N and $VALSIZE
 # expand at array-build time; the value bytes are built inside perl with ("v" x VALSIZE)
 # so the giant string never rides in the command and $VAL stays out of perl scope. GET
 # is the primary LTM read; SET measures the write path where f1srv appends to the cold
 # log while the rivals rewrite heap under the cap.
 ROWS=(
-  "get|for(0..$N-1){printf \"SET %012d %s\n\",\$_,('v' x $VALSIZE)}|GET __rand_int__"
-  "set|for(0..$N-1){printf \"SET %012d %s\n\",\$_,('v' x $VALSIZE)}|SET __rand_int__ $VAL"
+  "get|for(0..$N-1){printf \"SET k:%d %s\n\",\$_,('v' x $VALSIZE)}|GET"
+  "set|for(0..$N-1){printf \"SET k:%d %s\n\",\$_,('v' x $VALSIZE)}|SET"
 )
 
 # f1srv: start in an 8G scope, load all (index+keys resident, values to the cold log),

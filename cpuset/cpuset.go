@@ -6,10 +6,10 @@
 // drives it from the same process on a loaded box, the Go client goroutines and
 // the server threads fight for the same cores. The fight depresses the measured
 // throughput and understates the ratio: a GET workload that clears 2x under
-// redis-benchmark with separate client threads can read as 1.79x under a
+// memtier_benchmark with separate client threads can read as 1.79x under a
 // co-located aki-bench, purely because the client starved the server. Pinning
 // the two sides to disjoint core sets removes the contention and makes the
-// co-located number trustworthy, the same way redis-benchmark --threads N keeps
+// co-located number trustworthy, the same way memtier_benchmark --threads N keeps
 // its load threads off the server's cores.
 //
 // The clean fix is still to run the client on a separate box through connect
@@ -26,8 +26,8 @@ import (
 // Partition splits numCPU cores into a server set and a client set that do not
 // overlap. The client gets clientCores cores taken from the high end of the
 // range and the server gets the rest from the low end, so the two sides sit on
-// separate cores the way redis-benchmark keeps its load threads off the server.
-// Unlike redis-benchmark's light C threads, aki-bench's Go client needs a
+// separate cores the way memtier_benchmark keeps its load threads off the server.
+// Unlike memtier's light C threads, aki-bench's Go client needs a
 // generous share to avoid becoming the bottleneck, so callers usually size
 // clientCores from DefaultClientCores. Both returned values are taskset -c lists
 // (for example "0-2" and "3-5").
@@ -57,7 +57,7 @@ func Partition(numCPU, clientCores int) (server, client string, err error) {
 //
 // Half, not a quarter: aki-bench's load generator is a Go client that does its
 // own RESP encode, decode, and histogram work per reply, so it is far heavier
-// per operation than redis-benchmark's C threads. A quarter of the box starves
+// per operation than memtier's C threads. A quarter of the box starves
 // it, and a starved client cannot drive the server to saturation, which caps all
 // three targets at the client's ceiling and collapses the measured ratio toward
 // 1.0. On a quiet 6-core box a 3-core client lets aki saturate near 0.9M ops/s
