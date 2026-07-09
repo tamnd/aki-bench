@@ -17,7 +17,10 @@ single point.
 ## What it found
 
 server2, 6 cores, kernel 6.8, quiet box, June 2026. Each engine pinned to cores 0-3,
-two `redis-benchmark` clients pinned to cores 4 and 5 and summed. Matched core budget:
+the load generator pinned to cores 4 and 5. This run predates the memtier switch and
+was measured with two summed `redis-benchmark` clients; `run.sh` now drives the same
+shape with one memtier process (`--threads 2`), which reports a single Totals number
+and needs no summing. Matched core budget:
 aki `GOMAXPROCS=4`; Redis and Valkey `io-threads=4` (Redis also
 `io-threads-do-reads yes`), their strongest setting. aki runs `--aki-engine hot`, its
 in-memory tier, the fair match to Redis and Valkey serving from memory. Rivals are
@@ -63,8 +66,8 @@ sudo ./run.sh                                   # full GET+SET sweep, P16..P512
 AKI=/path/to/aki ./run.sh                        # point at a specific aki binary
 ```
 
-Environment overrides: `AKI` (binary), `PORT`, `NKEYS`, `N` (gets/client), `CLIENTS`,
-`DEPTHS`. Needs `redis-server`, `valkey-server`, `redis-cli`, `redis-benchmark`,
+Environment overrides: `AKI` (binary), `MT` (memtier path), `PORT`, `NKEYS`, `CLIENTS`,
+`DEPTHS`. Needs `redis-server`, `valkey-server`, `redis-cli`, `memtier_benchmark`,
 `taskset`, and cgroup-free root or a user that can pin cores. Run on a quiet box and
 read the cluster across reps, not a single point: the shallow depths sit near the
 syscall floor and move with box load, while the deep-pipeline GET ratio is stable.

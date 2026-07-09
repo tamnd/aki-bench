@@ -9,28 +9,35 @@ a row, not a new script.
 
 ## What it measures
 
-One collection of `N` elements at 255 bytes each (a 12-digit id at the front, then
-243 bytes of pad). At the default `N=3000000` that is about 730 MB of raw element
-data, served under a 300 MB cap, so the working set is more than twice the cap. The
-rows:
+One collection of `N` elements at about 248 bytes each (a one-char prefix, a decimal
+id, then 243 bytes of pad). At the default `N=3000000` that is about 710 MB of raw
+element data, served under a 300 MB cap, so the working set is more than twice the cap.
+The rows:
 
-| row       | type | builds        | probe                       |
-|-----------|------|---------------|-----------------------------|
-| sismember | set  | `SADD s:0 ...`| `SISMEMBER s:0 <rand>`      |
-| zscore    | zset | `ZADD z:0 ...`| `ZSCORE z:0 <rand>`         |
-| zrank     | zset | `ZADD z:0 ...`| `ZRANK z:0 <rand>`          |
-| hget      | hash | `HSET h:0 ...`| `HGET h:0 <rand>`           |
-| lindex    | list | `RPUSH l:0 ...`| `LINDEX l:0 <rand>`        |
+| row         | type | builds        | probe                       |
+|-------------|------|---------------|-----------------------------|
+| sismember   | set  | `SADD s:0 ...`| `SISMEMBER s:0 <rand>`      |
+| srandmember | set  | `SADD s:0 ...`| `SRANDMEMBER s:0`           |
+| zscore      | zset | `ZADD z:0 ...`| `ZSCORE z:0 <rand>`         |
+| zrank       | zset | `ZADD z:0 ...`| `ZRANK z:0 <rand>`          |
+| hget        | hash | `HSET h:0 ...`| `HGET h:0 <rand>`           |
 
-The probe element is `__rand_int__` plus the pad, so redis-benchmark's 12-digit
-random substitution lands on a stored element every time. LINDEX substitutes the
-random straight into the index, so `<rand>` in `[0, N)` is always a valid position
-in the `N`-element list.
+memtier draws a random id in `[0, N)` and substitutes it as `__key__` = `k` + id over
+the fixed `--key-prefix=k`, so the probe element is that keyed id plus the same pad
+literal the load used, and it lands on a stored element every time. The prefix is a
+real character because memtier refuses an empty prefix (it exits with a usage error),
+and the loader writes the same `k`-prefixed members so load and probe agree.
 
-Each row is one point read, one per type. That is the shape redis-benchmark's
-`__rand_int__` template fits: a single random id dropped into a fixed command. A
-bounded range or scan needs a computed window (`start, start+window`) and the
-template can only drop independent randoms, so `ZRANGE z:0 r1 r2` lands empty
+The list point read (LINDEX by position) is not a row here for a mechanical reason:
+memtier substitutes `__key__` only as prefix + id and refuses an empty prefix, so it
+cannot emit the bare integer a LINDEX index needs. LINDEX random access is covered in
+the in-memory-fit scenario, whose aki-bench plan generator produces the numeric index
+directly.
+
+Each row is one point read, one per type. That is the shape memtier's `__key__`
+substitution fits: a single random id dropped into a fixed command. A bounded range or
+scan needs a computed window (`start, start+window`) and a single `__key__` can only
+drop one random, so `ZRANGE z:0 r1 r2` lands empty
 whenever `r1 > r2`; an algebra like `SINTER` needs a second loaded collection,
 which doubles the dataset and breaks the single-collection cap math the fairness
 rule depends on. Those shapes are exercised in the in-memory-fit scenario, which
@@ -68,15 +75,22 @@ sudo AKI=/path/to/aki \
      ./run.sh
 ```
 
-Knobs (environment variables): `N`, `CAP`, `SWAP`, `GETN`, `CLIENTS`, `PIPE`,
-`REPS`, `BP` (aki buffer-pool budget), `PORT`. The defaults are the baseline
-configuration: `N=3000000`, `CAP=300M`, `SWAP=4096M`, `PIPE=16`, `REPS=2`.
+Knobs (environment variables): `N`, `CAP`, `SWAP`, `PTIME` (seconds per memtier
+probe), `CLIENTS`, `THREADS` (memtier client threads), `PIPE`, `REPS`, `BP` (aki
+buffer-pool budget), `PORT`. The probe is `memtier_benchmark`, so it must be on
+`PATH`. The defaults are the baseline configuration: `N=3000000`, `CAP=300M`,
+`SWAP=4096M`, `PIPE=16`, `REPS=2`.
 
 A fits-in-RAM control is just the same script with a small `N` and a large `CAP`
 (for example `N=20000 CAP=2G`); there aki loses to both rivals, which proves the
 LTM win is the structural effect and not a tilt in aki's favor.
 
 ## Baseline result (server2, 6 cores, N=3000000, cap=300M, two reps)
+
+This table predates the memtier switch and was measured with the old redis-benchmark
+probe over 255-byte members; `run.sh` now drives the same point reads with memtier over
+~247-byte members. The serve-time effect being measured is unchanged, so the ratios
+stand as the reference until the next sweep re-records them memtier-native.
 
 aki dev (order-statistic tree merged) against Redis 8.8.0 and Valkey 9.1.0. Every
 engine loaded the 3M-element collection with full RAM, then served random point
@@ -101,14 +115,15 @@ rank stays a single logarithmic walk even when swapped, so it holds up. ZRANK is
 therefore a still-slow site under the standing rule and is tracked as the next LTM
 optimization; the goal stays open until it clears 2x against both engines.
 
-The `lindex` list row was added after this run, so it is not in the table above; it
-lands in the next baseline sweep.
+The `srandmember` set row runs alongside the point reads; the list type has no memtier
+row here because LINDEX needs a bare numeric index memtier cannot emit, so its LTM
+random-access coverage lives in the in-memory-fit scenario instead.
 
 ## Scope
 
 This run is uniform-random. The skew (zipfian) rows the spec also calls for, to show
 the hot-tier win, are a separate follow-up and are not measured here; the script
-prints that so the coverage gap is explicit rather than silent. The 255-byte-element
+prints that so the coverage gap is explicit rather than silent. The ~247-byte-element
 shape is the one where every type keeps its element in a small btree key or in the
 value behind a small key; a pathological all-key set of very large members is a
 different boundary, recorded in the set LTM notes.

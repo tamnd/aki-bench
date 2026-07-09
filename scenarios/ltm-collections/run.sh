@@ -5,7 +5,7 @@
 # (spec 2064/ltm/05). One row per gated collection read. Every row loads ONE
 # collection larger than the RAM cap, then measures random point reads against it
 # under a hard cgroup cap. A row is "command + the load that builds its collection +
-# the redis-benchmark probe". Adding a command is a row, not a new script.
+# the memtier probe". Adding a command is a row, not a new script.
 #
 # The fairness rule that matters (spec 2064/ltm/05 section 1): every engine LOADS
 # with full RAM, THEN the cap is tightened below the dataset and reads are served.
@@ -15,35 +15,47 @@
 # pool; Redis and Valkey hold the whole collection in heap and fault the swapped
 # overflow on each read.
 #
-# Members are 255B: a 12-digit id at the FRONT then 243 bytes of pad. The id-first
-# shape is what redis-benchmark's __rand_int__ (a 12-digit zero-padded random in
-# [0,r)) substitutes, so a probe hits a stored element. The pad keeps leaf
-# separators short so aki's interior index stays small.
+# Members are a one-char prefix, a decimal id, then 243 bytes of pad (~248B). memtier
+# builds the id part as __key__ over the fixed --key-prefix=k, so __key__ is "k" plus
+# the decimal id 0..N-1, and the probe command appends the same 243-byte pad literal
+# after it. The load streams the identical prefix-id-then-pad members through
+# redis-cli --pipe, so load and probe share one member generator and a probe hits a
+# stored element. memtier rejects an empty --key-prefix (it exits with a usage error),
+# so the prefix is a real character rather than nothing; the id-first-after-prefix
+# shape still keeps leaf separators short so aki's interior index stays small.
 #
 # This run is uniform-random. Zipfian (skew) is a separate row set the spec calls
 # for to show the hot-tier win; it is NOT measured here and is logged as a gap, not
 # silently dropped.
 #
 # The recipe is point reads by design, one per type: SISMEMBER, ZSCORE, ZRANK,
-# HGET, LINDEX. redis-benchmark's __rand_int__ substitutes a random 12-digit id
-# into a fixed template, which fits a point lookup exactly and a range or algebra
-# shape poorly: a windowed read needs a computed pair (start, start+window) and
-# __rand_int__ can only drop independent randoms, so ZRANGE r1 r2 lands empty
-# whenever r1>r2; an algebra like SINTER needs a second loaded collection, which
-# doubles the dataset and breaks the single-collection cap math this fairness rule
-# depends on. Forcing those shapes here would measure a degenerate probe, not the
+# HGET. memtier's --command-key-pattern=R draws a random id in [0,N) and substitutes
+# it as __key__ in a fixed command template, which fits a point lookup exactly and a
+# range or algebra shape poorly: a windowed read needs a computed pair
+# (start, start+window) and a single __key__ can only drop one random, so ZRANGE r1 r2
+# lands empty whenever r1>r2; an algebra like SINTER needs a second loaded collection,
+# which doubles the dataset and breaks the single-collection cap math this fairness
+# rule depends on. Forcing those shapes here would measure a degenerate probe, not the
 # serve-time win. The bounded range, scan, and algebra shapes are exercised in the
 # in-memory-fit scenario instead, which drives aki-bench's plan probes rather than
-# redis-benchmark; carrying them into the capped LTM regime needs a probe generator
-# that can compute a window, and that is a logged follow-up, not a silent drop.
+# memtier; carrying them into the capped LTM regime needs a probe generator that can
+# compute a window, and that is a logged follow-up, not a silent drop.
+#
+# The list point read (LINDEX by position) is not a row here for a mechanical reason:
+# memtier can only substitute __key__ as key-prefix + id, and it refuses an empty
+# prefix, so it cannot emit the bare integer a LINDEX index needs. LINDEX random access
+# is covered in the in-memory-fit scenario, whose aki-bench plan generator produces the
+# numeric index directly; carrying it into the capped regime needs the same window-aware
+# probe generator noted above, so it is a logged gap, not a silent drop.
 set -u
 
 CAP=${CAP:-300M}        # RAM cap the read phase serves under
 SWAP=${SWAP:-4096M}     # swap room the rivals fault into
-N=${N:-3000000}         # elements in the one big collection (~765MB raw at 255B)
+N=${N:-3000000}         # elements in the one big collection (~740MB raw at ~247B)
 PORT=${PORT:-7047}
-GETN=${GETN:-100000}    # random probes per measurement
+PTIME=${PTIME:-10}      # seconds per measured probe (memtier --test-time)
 CLIENTS=${CLIENTS:-50}
+THREADS=${THREADS:-4}   # memtier client threads
 PIPE=${PIPE:-16}
 REPS=${REPS:-2}
 BP=${BP:-128mb}         # aki buffer-pool budget: how much of the .aki file stays resident
@@ -60,25 +72,35 @@ drop_caches() { sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; }
 wait_up() { local i; for i in $(seq 1 600); do redis-cli -p $PORT ping >/dev/null 2>&1 && return 0; sleep 0.2; done; return 1; }
 swap_mb() { free -m | awk '/Swap/{print $3}'; }
 rss_mb() { local pid; pid=$(redis-cli -p $PORT info server 2>/dev/null | tr -d '\r' | awk -F: '/process_id/{print $2}'); [ -n "$pid" ] && awk '/VmRSS/{printf "%d",$2/1024}' /proc/$pid/status 2>/dev/null; }
-# Pull the rate token that sits right before "requests" in redis-benchmark -q output,
-# so the probe command's own arguments never shift a fixed column.
-rate() { tr '\r' '\n' | awk '{for(i=1;i<=NF;i++)if($i=="requests")v=$(i-1)} END{print v+0}'; }
 
 # --- the row table -----------------------------------------------------------
-# Each row is: name | type | load-perl | card-cmd | probe redis-benchmark args.
+# Each row is: name | type | load-perl | card-cmd | memtier --command template.
 # load-perl prints inline commands to stream through redis-cli --pipe; it expands
-# $N and $PAD and $VAL at eval time.
+# $N and $PAD and $VAL at eval time. memtier draws a random id and substitutes
+# __key__ = "k" + id (the fixed non-empty prefix, see probe()), so the load writes
+# members "k" + id + $PAD and the probe command appends the same $PAD literal after
+# __key__ so the substituted member matches a loaded one. SRANDMEMBER carries no
+# __key__, so it draws a stored member on its own regardless of the prefix. The zset
+# score stays the bare id; only the member carries the k prefix.
 ROWS=(
-  "sismember|set|for(0..$N-1){printf \"SADD s:0 %012d${PAD}\n\",\$_}|scard s:0|SISMEMBER s:0 __rand_int__${PAD}"
-  "srandmember|set|for(0..$N-1){printf \"SADD s:0 %012d${PAD}\n\",\$_}|scard s:0|SRANDMEMBER s:0"
-  "zscore|zset|for(0..$N-1){printf \"ZADD z:0 %d %012d${PAD}\n\",\$_,\$_}|zcard z:0|ZSCORE z:0 __rand_int__${PAD}"
-  "zrank|zset|for(0..$N-1){printf \"ZADD z:0 %d %012d${PAD}\n\",\$_,\$_}|zcard z:0|ZRANK z:0 __rand_int__${PAD}"
-  "hget|hash|for(0..$N-1){printf \"HSET h:0 %012d${PAD} ${VAL}\n\",\$_}|hlen h:0|HGET h:0 __rand_int__${PAD}"
-  "lindex|list|for(0..$N-1){printf \"RPUSH l:0 %012d${PAD}\n\",\$_}|llen l:0|LINDEX l:0 __rand_int__"
+  "sismember|set|for(0..$N-1){printf \"SADD s:0 k%d${PAD}\n\",\$_}|scard s:0|SISMEMBER s:0 __key__${PAD}"
+  "srandmember|set|for(0..$N-1){printf \"SADD s:0 k%d${PAD}\n\",\$_}|scard s:0|SRANDMEMBER s:0"
+  "zscore|zset|for(0..$N-1){printf \"ZADD z:0 %d k%d${PAD}\n\",\$_,\$_}|zcard z:0|ZSCORE z:0 __key__${PAD}"
+  "zrank|zset|for(0..$N-1){printf \"ZADD z:0 %d k%d${PAD}\n\",\$_,\$_}|zcard z:0|ZRANK z:0 __key__${PAD}"
+  "hget|hash|for(0..$N-1){printf \"HSET h:0 k%d${PAD} ${VAL}\n\",\$_}|hlen h:0|HGET h:0 __key__${PAD}"
 )
 
 load_pipe() { perl -e "$1" | redis-cli -p $PORT --pipe >/dev/null 2>&1; }
-probe() { redis-benchmark -p $PORT -r $N -n $GETN -c $CLIENTS -P $PIPE -q $1 2>/dev/null | rate; }
+# Probe with memtier: draw a random id in [0,N), form __key__ = k + id over the fixed
+# non-empty --key-prefix=k, and fire the row's command template. memtier refuses an
+# empty prefix, so the members were loaded with the same k prefix to match. The rate is
+# memtier's single Totals ops/sec line.
+probe() {
+  memtier_benchmark -p $PORT --command="$1" --command-key-pattern=R \
+    --key-prefix=k --key-minimum=1 --key-maximum=$((N-1)) \
+    -c $CLIENTS -t $THREADS --pipeline $PIPE --test-time $PTIME --hide-histogram \
+    --distinct-client-seed 2>/dev/null | awk '/Totals/{printf "%.0f",$2;exit}'
+}
 
 # aki: load uncapped to its file, save, restart serving from the file under the cap.
 meas_aki() {
@@ -118,8 +140,8 @@ meas_mem() {
   reset_scope; rm -rf $D; echo "$g"
 }
 
-raw=$(awk "BEGIN{printf \"%.0f\", $N*255/1048576}")
-echo "== FAIR LTM collection matrix: $N elements x 255B (~${raw}MB raw), load-uncapped then cap=$CAP, $(nproc) cores =="
+raw=$(awk "BEGIN{printf \"%.0f\", $N*248/1048576}")
+echo "== FAIR LTM collection matrix: $N elements x ~248B (~${raw}MB raw), load-uncapped then cap=$CAP, $(nproc) cores =="
 echo "== aki=$($AKI --version 2>/dev/null | head -1) | redis $($REDIS --version | grep -o 'v=[0-9.]*') | valkey $($VALKEY --version | grep -o 'v=[0-9.]*') =="
 echo "== uniform-random probes; zipfian/skew rows are a separate follow-up, not measured here =="
 
