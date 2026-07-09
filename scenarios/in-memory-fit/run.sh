@@ -69,7 +69,8 @@ fi
 ROWS=(
   "f1raw|string|set get incr getrange"
   "f1raw|hash|hset hget hscan hgetall hdel"
-  "f1raw|set|sadd sismember sscan sinter srem spop"
+  "f1raw|set|sadd sismember smismember scard sscan smembers srem spop srandmember srandmembercount smove"
+  "f1raw|setalgebra|sinter sunion sdiff sintercard sinterstore sunionstore sdiffstore"
   "f1raw|zset|zadd zscore zrange zrank zunion zrem"
   "f1raw|list|lpush lrange lpop lindex"
   "f1raw|stream|xadd xrange xread xreadgroup"

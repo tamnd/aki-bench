@@ -62,6 +62,16 @@ type Spec struct {
 	AkiEngine string
 	AkiNet    string
 
+	// AkiExtraArgs are extra server flags appended verbatim to a launched aki or
+	// f1srv command, after the durability and engine flags. It is how a scenario
+	// engages an opt-in server path the default launch would leave off: the set
+	// campaign passes -set-algebra-merge here so the launched f1srv maintains the
+	// per-set sorted member-hash arrays and answers SINTER/SDIFF/SINTERCARD through
+	// the doc-24 two-pointer merge rather than the point-probe, which is the path
+	// the 2x gate is meant to measure. It is ignored for Redis and Valkey, which
+	// take their own flags, and in connect mode, where the server is already up.
+	AkiExtraArgs []string
+
 	// CPUList, when set, pins the launched server to those cores via taskset (a
 	// Linux taskset -c list such as "0-3"). It is applied identically to aki,
 	// Redis, and Valkey so the comparison stays fair, and it is the server half of
@@ -154,7 +164,7 @@ func launchOnce(s Spec, resolved string) (*Target, error) {
 		return nil, fmt.Errorf("target %s: %w", s.Kind, err)
 	}
 
-	args := launchArgs(s.Kind, port, dataDir, s.Durability, s.AkiEngine, s.AkiNet)
+	args := launchArgs(s.Kind, port, dataDir, s.Durability, s.AkiEngine, s.AkiNet, s.AkiExtraArgs)
 	runBin, runArgs := cpuset.ServerWrap(s.CPUList, resolved, args)
 	cmd := exec.Command(runBin, runArgs...)
 	cmd.Dir = dataDir
@@ -232,8 +242,10 @@ func defaultBinary(k Kind) string {
 // launchArgs builds the command-line flags that put each server in the requested
 // fairness config on the given port and data directory. akiEngine and akiNet,
 // when non-empty, select aki's string-path storage engine and networking model;
-// they are ignored for Redis and Valkey.
-func launchArgs(k Kind, port int, dataDir string, d Durability, akiEngine, akiNet string) []string {
+// they are ignored for Redis and Valkey. akiExtra is appended verbatim after the
+// aki engine/net flags, the passthrough a scenario uses to engage an opt-in server
+// path such as -set-algebra-merge; it too is ignored for Redis and Valkey.
+func launchArgs(k Kind, port int, dataDir string, d Durability, akiEngine, akiNet string, akiExtra []string) []string {
 	p := strconv.Itoa(port)
 	switch k {
 	case Aki:
@@ -253,6 +265,7 @@ func launchArgs(k Kind, port int, dataDir string, d Durability, akiEngine, akiNe
 		if akiNet != "" {
 			args = append(args, "--aki-net", akiNet)
 		}
+		args = append(args, akiExtra...)
 		return args
 	case Redis, Valkey:
 		args := []string{

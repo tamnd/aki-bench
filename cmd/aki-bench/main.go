@@ -111,6 +111,9 @@ func run(args []string) error {
 		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product) or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
 		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
 
+		setAlgebraMerge = fs.Bool("set-algebra-merge", true, "launch f1srv with -set-algebra-merge so SINTER/SDIFF/SINTERCARD run the doc-24 sorted two-pointer merge, the product path the set-algebra 2x gate measures; on by default, pass -set-algebra-merge=false to measure the point-probe. Only applies to the f1raw engine; a legacy engine ignores it")
+		akiExtraArgs    = fs.String("aki-extra-args", "", "extra server flags passed verbatim to a launched aki or f1srv, space-separated, for example \"-ltm-cold -arena-segmented\"; appended after the engine flags and ignored for Redis and Valkey")
+
 		cpuSplit  = fs.Bool("cpu-split", true, "partition cores so the launched server and the load generator never share a core (Linux launch mode, on by default); removes the co-located-client starvation that understates the ratio; pass -cpu-split=false to co-locate")
 		cpuServer = fs.String("cpu-server", "", "taskset -c list for the server half of -cpu-split, for example 0-3; empty auto-derives from the core count")
 		cpuClient = fs.String("cpu-client", "", "taskset -c list for the load-generator half of -cpu-split, for example 4-5; empty auto-derives from the core count")
@@ -163,6 +166,20 @@ func run(args []string) error {
 		akiServerBin = *f1srvBin
 	}
 
+	// Assemble the extra server flags the launched aki gets. -set-algebra-merge is
+	// an f1srv-only flag, so it is only added for the f1raw engine; a legacy engine
+	// served by the aki binary would reject an unknown flag and fail to launch. The
+	// campaign wants this on by default so the set-algebra numbers measure the doc-24
+	// sorted merge rather than the point-probe. -aki-extra-args is appended verbatim
+	// for arbitrary extra flags such as the LTM tier.
+	var akiExtra []string
+	if engine == "f1raw" && *setAlgebraMerge {
+		akiExtra = append(akiExtra, "--set-algebra-merge")
+	}
+	if *akiExtraArgs != "" {
+		akiExtra = append(akiExtra, strings.Fields(*akiExtraArgs)...)
+	}
+
 	// Pin the launched server and this load generator to disjoint cores when
 	// asked. On a co-located run the Go client and the server otherwise fight for
 	// the same cores, which starves the server and understates the ratio. The
@@ -172,7 +189,7 @@ func run(args []string) error {
 	serverCPUs := applyCPUSplit(*cpuSplit, *cpuServer, *cpuClient, launching)
 
 	specs := []target.Spec{
-		{Kind: target.Aki, Binary: akiServerBin, Addr: *akiAddr, Durability: dur, AkiEngine: engine, AkiNet: *akiNet, CPUList: serverCPUs},
+		{Kind: target.Aki, Binary: akiServerBin, Addr: *akiAddr, Durability: dur, AkiEngine: engine, AkiNet: *akiNet, AkiExtraArgs: akiExtra, CPUList: serverCPUs},
 		{Kind: target.Redis, Binary: *redisBin, Addr: *redisAddr, Durability: dur, CPUList: serverCPUs},
 		{Kind: target.Valkey, Binary: *valkeyBin, Addr: *valkeyAddr, Durability: dur, CPUList: serverCPUs},
 	}
