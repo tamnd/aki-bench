@@ -21,6 +21,12 @@ type Spec struct {
 	Members   int     // member space for a single-collection probe (sismember, hget, ...)
 	Dist      string  // access pattern over the space: "uniform" (default) or "zipfian"
 	ZipfS     float64 // zipfian skew exponent, used when Dist is "zipfian"; 0 means 0.99
+
+	// Track, when set, receives every index the workload's selector draws, so
+	// the run can report how much of the nominal space it actually touched.
+	// The caller owns the tracker's lifecycle: one per measured target, reset
+	// after warmup.
+	Track *Tracker
 }
 
 func (s Spec) withDefaults() Spec {
@@ -44,9 +50,9 @@ func (s Spec) withDefaults() Spec {
 // head of keys, which is the shape a read cache and the F2 hot tier are built for.
 func (s Spec) keySelector() Selector {
 	if s.Dist == "zipfian" {
-		return zipfianSelector(int64(s.KeyCount), s.ZipfS)
+		return tracked(zipfianSelector(int64(s.KeyCount), s.ZipfS), s.Track)
 	}
-	return uniformSelector(int64(s.KeyCount))
+	return tracked(uniformSelector(int64(s.KeyCount)), s.Track)
 }
 
 // memberSelector returns the access pattern over a single collection's member
@@ -55,9 +61,9 @@ func (s Spec) keySelector() Selector {
 // KeyCount.
 func (s Spec) memberSelector() Selector {
 	if s.Dist == "zipfian" {
-		return zipfianSelector(int64(s.Members), s.ZipfS)
+		return tracked(zipfianSelector(int64(s.Members), s.ZipfS), s.Track)
 	}
-	return uniformSelector(int64(s.Members))
+	return tracked(uniformSelector(int64(s.Members)), s.Track)
 }
 
 // value builds a deterministic payload of the configured size. The content does

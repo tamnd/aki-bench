@@ -48,6 +48,15 @@ type Config struct {
 	// regime. Nothing from the warmup reaches the result: its ops, errors,
 	// latencies, and wire bytes are all discarded.
 	Warmup time.Duration
+
+	// AfterWarmup, if set, runs once after the warmup drive finishes and
+	// before the measured window starts. It exists for the same reason the
+	// wire-byte baseline is snapshotted at that point: per-run accounting that
+	// lives outside this package (the workload's distinct-key tracker) needs
+	// to discard what warmup touched so it describes only the measured
+	// seconds. It runs on the coordinating goroutine while no drive loop is
+	// active, so it may touch shared state freely.
+	AfterWarmup func()
 }
 
 func (c Config) withDefaults() Config {
@@ -152,6 +161,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	// the bytes/s column.
 	if cfg.Warmup > 0 {
 		warm(ctx, cfg, clients)
+	}
+	if cfg.AfterWarmup != nil {
+		cfg.AfterWarmup()
 	}
 	baseRead := make([]int64, len(clients))
 	baseWritten := make([]int64, len(clients))
