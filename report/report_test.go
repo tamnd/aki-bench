@@ -331,6 +331,40 @@ func TestWriteTableShowsValueColumnsAndNotes(t *testing.T) {
 	}
 }
 
+func TestWithEvictionRendersServerWindow(t *testing.T) {
+	aki := valueEntry("aki", 40000, 1.0, 50)
+	redis := valueEntry("redis", 4850000, 0.30, 60).WithEviction(load.EvictionStats{
+		KeyspaceHits: 1500000, KeyspaceMisses: 3350000, EvictedKeys: 1300000,
+		Maxmemory: 512 << 20, MaxmemoryPolicy: "allkeys-lfu"})
+	valkey := valueEntry("valkey", 4150000, 0.30, 55)
+	cmp := NewComparison("get", aki, redis, valkey, DefaultRequiredSpeedup)
+
+	var tbuf bytes.Buffer
+	cmp.WriteTable(&tbuf)
+	out := tbuf.String()
+	if !strings.Contains(out, "policy=allkeys-lfu") || !strings.Contains(out, "evicted=1300000") {
+		t.Fatalf("table missing the server window line:\n%s", out)
+	}
+	if !strings.Contains(out, "maxmemory=512 MB") {
+		t.Fatalf("table missing the cap:\n%s", out)
+	}
+
+	var jbuf bytes.Buffer
+	if err := cmp.WriteJSON(&jbuf); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"\"evicted_keys\": 1300000", "\"maxmemory_policy\": \"allkeys-lfu\"", "\"server_misses\": 3350000"} {
+		if !strings.Contains(jbuf.String(), want) {
+			t.Fatalf("json missing %s:\n%s", want, jbuf.String())
+		}
+	}
+	// aki carries no eviction readback (no INFO) and must not print a window
+	// line or fake JSON zeros.
+	if strings.Contains(out, "aki server window") {
+		t.Fatalf("aki must not print a server window without a probe:\n%s", out)
+	}
+}
+
 func TestComparisonCarriesCell(t *testing.T) {
 	cmp := NewComparison("set",
 		entry("aki", 200000, 50),
