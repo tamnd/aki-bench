@@ -104,9 +104,13 @@ The gate is one function, `report.EvaluateGate`, and it is deliberately strict.
 It passes only when all of the following hold:
 
 1. aki, Redis, and Valkey were all measured. If any target was skipped the gate fails, because a number that "passes" because a competitor was missing means nothing.
-2. aki's throughput is at least the required multiple (2.0 by default, set with `-gate`) of Redis throughput.
-3. aki's throughput is at least the same multiple of Valkey throughput.
+2. aki's value-bearing throughput is at least the required multiple (2.0 by default, set with `-gate`) of Redis's value-bearing throughput.
+3. aki's value-bearing throughput is at least the same multiple of Valkey's.
 4. aki's p99 latency is not worse than either Redis or Valkey on the same workload.
+
+Value-bearing throughput is completed operations minus nil replies and server error replies, per second.
+A nil answered a read with nothing and a `-ERR` refused the command, so neither earns gate credit; on an in-RAM row where every reply carries data it is identical to raw ops/s.
+A rival whose window was all nils served nothing to beat, and the gate says so instead of dividing by zero.
 
 The required multiplier, the achieved speedups, and the reason for the verdict are all written into the JSON artifact, so a failing run says exactly why it failed.
 
@@ -143,8 +147,22 @@ On a quiet 6-core box the default 3-core server and 3-core client let aki satura
 
 ## Measurement pitfalls
 
-The f3 M0 gate investigation (tamnd/aki#542) turned up two ways a gate cell can lie, and the harness now defends against both.
+The f3 M0 gate investigation (tamnd/aki#542) turned up three ways a gate cell can lie, and the harness now defends against all of them.
 They are worth knowing about even so, because the defenses only work if you read the markers.
+
+### Nil-serving rivals in larger-than-memory cells
+
+An in-RAM engine under `--maxmemory` with an `allkeys` eviction policy does not slow down when the dataset outgrows the cap; it throws data away and answers the evicted keys' GETs with a nil at RAM speed, zero disk reads.
+A harness that counts every reply as an op then scores the eviction as throughput.
+The M0 LTM cell did exactly that: rivals capped at 512mb with allkeys-lfu evicted roughly two thirds of a ~2GB keyspace, posted ~4.85M "ops/s" of which about 70 percent were nils, and aki's 40k fully value-bearing reads from its value log were recorded as 0.01x.
+The bytes/s column carried the tell the whole time: 352 bytes per op from redis on a 1KiB-value workload.
+
+Three defenses now stack against this.
+The load counters classify every reply, so each row carries `nil_replies`, `err_replies`, `hit_ratio`, and `value_ops_per_sec` (never omitted from the JSON), and the table shows vops/sec and hit% next to raw ops/s.
+The gate compares value-bearing throughput, as described under "The 2x gate".
+And the harness reads `keyspace_hits`, `keyspace_misses`, `evicted_keys`, and the cap and policy back from each server's INFO around the measured window, printing them under the table, so the rival's own accounting confirms what the nils were.
+The capped-eviction posture itself is still the right one for an LTM cell (an uncapped rival just swaps, which is a different and worse regime); `scenarios/f3-ltm-strings/run.sh` runs it with the rival flags stated in the transcript.
+When you read such a row, remember the asymmetry behind the hit ratios: aki still holds every value and can return it, the rivals permanently dropped theirs.
 
 ### Generator-bound rows
 
