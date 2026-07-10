@@ -83,6 +83,12 @@ Open-loop run at a fixed rate, emitting JSON for CI:
 aki-bench -workload get -open-loop -rate 200000 -duration 10s -json results.json
 ```
 
+Gate runs should warm every measured window so no target gets its timed seconds on a rested CPU:
+
+```
+aki-bench -workload get -duration 10s -warm 10s
+```
+
 The compatibility smoke check instead of a load run:
 
 ```
@@ -134,6 +140,40 @@ Off Linux, and in connect mode where the servers are already running elsewhere, 
 By default the client takes half the machine and the server takes the other half; `-cpu-server` and `-cpu-client` override the two `taskset -c` lists.
 Half, not a quarter: the load generator is a Go client that encodes, decodes, and records a histogram per reply, so it is much heavier than memtier's C threads, and under-provisioning it makes the client the bottleneck and collapses the measured ratio.
 On a quiet 6-core box the default 3-core server and 3-core client let aki saturate near 0.9M ops/s, where a 2-core client strangled the same run below 0.65M and dragged a real 2x down to 1.3x.
+
+## Measurement pitfalls
+
+The f3 M0 gate investigation (tamnd/aki#542) turned up two ways a gate cell can lie, and the harness now defends against both.
+They are worth knowing about even so, because the defenses only work if you read the markers.
+
+### Generator-bound rows
+
+A closed-loop generator has a ceiling of its own, and once it saturates, every server it drives reports the same number: the generator's, not the server's.
+The tell is a three-way tie plus the closed-loop latency identity.
+In a saturated closed loop even the fastest operation spends its whole life queued in the loop, so the minimum latency collapses to outstanding requests divided by throughput.
+The M0 gate hit this with redis-benchmark at pipeline 16 and 512 connections: all targets within noise at about 2.1M ops/s, min latency exactly outstanding over throughput, and the row got quoted as capacity while the same server did 4.21M ops/s under aki-bench.
+
+The harness flags this on every closed-loop row: when the three throughputs fall within `-gen-bound-epsilon` of each other (10 percent by default) and the identity holds on every target, the JSON carries `generator_bound: true` and the table prints a GENERATOR-BOUND line.
+A flagged row says the generator saturated, nothing more.
+Never quote it as a capacity number for any server in it.
+
+### Rested first window and the fixed target order
+
+The harness measures its targets in a fixed order: aki, then Redis, then Valkey.
+The first window a box serves after an idle gap runs on a rested CPU package, with boost headroom and cold-package power budget the later windows never see.
+With a fixed order that rest is a systematic bias toward the same target every run, not noise that averages out.
+
+`-warm 10s` closes this: it drives the exact connections the run is about to measure, untimed, for that long before every timed window, so every target's measured seconds run in the same hot regime.
+The default is `-warm 0s`, which keeps the old behavior, but gate runs should always pass `-warm 10s` or similar.
+Note that the warm drive issues real commands, so on a destructive workload like `lpop` or `xreadgroup` it consumes entries; size `-members` accordingly.
+
+### Profiling protocol
+
+Three rules for profile and capacity work that came out of the same investigation.
+
+1. Drive with aki-bench, not redis-benchmark. redis-benchmark's generator ceiling sits below what aki can serve at high pipeline depths, and a profile of a generator-bound server is a profile of waiting.
+2. Verify the rival's CPU utilization before quoting a ratio. A server that is not near saturation was not measured at capacity, and per-target CPU time per op is the cross-check the closed-loop identity cannot give you; the gate runner samples /proc cputime for exactly this.
+3. Burn in for 60 seconds before attaching a profiler. Frequency scaling, cache warmth, and allocator steady state all settle in the first minute, and a profile taken cold overweights code that only runs cold.
 
 ## Compatibility
 
