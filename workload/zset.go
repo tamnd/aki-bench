@@ -66,7 +66,7 @@ func ZMScore(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    zsetPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			start := windowStart(sel(seq), int64(s.Members))
+			start := windowStart(sel(conn, seq), int64(s.Members))
 			argv := make([][]byte, 0, 2+w)
 			argv = append(argv, zmscore, zsetProbeKey)
 			for i := range w {
@@ -93,7 +93,7 @@ func ZAddMember(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    zsetPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			idx := sel(seq)
+			idx := sel(conn, seq)
 			return [][]byte{zadd, zsetProbeKey, []byte(strconv.FormatInt(idx, 10)), memberName(idx)}
 		},
 	}
@@ -114,7 +114,7 @@ func ZIncrBy(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    zsetPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{zincrby, zsetProbeKey, zero, memberName(sel(seq))}
+			return [][]byte{zincrby, zsetProbeKey, zero, memberName(sel(conn, seq))}
 		},
 	}
 }
@@ -134,7 +134,7 @@ func ZRem(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    zsetPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{zrem, zsetProbeKey, memberName(sel(seq))}
+			return [][]byte{zrem, zsetProbeKey, memberName(sel(conn, seq))}
 		},
 	}
 }

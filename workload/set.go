@@ -63,7 +63,7 @@ func SMIsMember(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    setPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			start := windowStart(sel(seq), int64(s.Members))
+			start := windowStart(sel(conn, seq), int64(s.Members))
 			argv := make([][]byte, 0, 2+w)
 			argv = append(argv, smismember, setProbeKey)
 			for i := range w {
@@ -89,7 +89,7 @@ func SAddMember(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    setPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sadd, setProbeKey, memberName(sel(seq))}
+			return [][]byte{sadd, setProbeKey, memberName(sel(conn, seq))}
 		},
 	}
 }
@@ -108,7 +108,7 @@ func SRem(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    setPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{srem, setProbeKey, memberName(sel(seq))}
+			return [][]byte{srem, setProbeKey, memberName(sel(conn, seq))}
 		},
 	}
 }
@@ -188,7 +188,7 @@ func SMove(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    setPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{smove, setProbeKey, dstKey, memberName(sel(seq))}
+			return [][]byte{smove, setProbeKey, dstKey, memberName(sel(conn, seq))}
 		},
 	}
 }

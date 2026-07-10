@@ -70,7 +70,7 @@ func LSet(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    listPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{lset, listProbeKey, intArg(sel(seq)), val}
+			return [][]byte{lset, listProbeKey, intArg(sel(conn, seq)), val}
 		},
 	}
 }
@@ -88,7 +88,7 @@ func LPos(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    listPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{lpos, listProbeKey, memberName(sel(seq))}
+			return [][]byte{lpos, listProbeKey, memberName(sel(conn, seq))}
 		},
 	}
 }
@@ -109,7 +109,7 @@ func LInsert(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    listPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{linsert, listProbeKey, before, memberName(sel(seq)), ins}
+			return [][]byte{linsert, listProbeKey, before, memberName(sel(conn, seq)), ins}
 		},
 	}
 }
@@ -128,7 +128,7 @@ func LRem(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    listPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{lrem, listProbeKey, count, memberName(sel(seq))}
+			return [][]byte{lrem, listProbeKey, count, memberName(sel(conn, seq))}
 		},
 	}
 }

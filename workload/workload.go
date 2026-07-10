@@ -110,7 +110,7 @@ func Get(s Spec) load.CommandGen {
 	sel := s.keySelector()
 	cmd := []byte("GET")
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, keyAt("key:", sel(seq))}
+		return [][]byte{cmd, keyAt("key:", sel(conn, seq))}
 	}
 }
 
@@ -138,7 +138,7 @@ func GetRange(s Spec) load.CommandGen {
 			}
 		}
 		end := start + w - 1
-		return [][]byte{cmd, keyAt("key:", sel(seq)), intArg(start), intArg(end)}
+		return [][]byte{cmd, keyAt("key:", sel(conn, seq)), intArg(start), intArg(end)}
 	}
 }
 
@@ -149,7 +149,7 @@ func Set(s Spec) load.CommandGen {
 	cmd := []byte("SET")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, keyAt("key:", sel(seq)), val}
+		return [][]byte{cmd, keyAt("key:", sel(conn, seq)), val}
 	}
 }
 
@@ -159,7 +159,7 @@ func Incr(s Spec) load.CommandGen {
 	sel := s.keySelector()
 	cmd := []byte("INCR")
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, keyAt("ctr:", sel(seq))}
+		return [][]byte{cmd, keyAt("ctr:", sel(conn, seq))}
 	}
 }
 
@@ -176,7 +176,7 @@ func Append(s Spec) load.CommandGen {
 	cmd := []byte("APPEND")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, keyAt("key:", sel(seq)), val}
+		return [][]byte{cmd, keyAt("key:", sel(conn, seq)), val}
 	}
 }
 
@@ -187,7 +187,7 @@ func LPush(s Spec) load.CommandGen {
 	cmd := []byte("LPUSH")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, keyAt("list:", sel(seq)), val}
+		return [][]byte{cmd, keyAt("list:", sel(conn, seq)), val}
 	}
 }
 
@@ -198,7 +198,7 @@ func RPush(s Spec) load.CommandGen {
 	cmd := []byte("RPUSH")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, keyAt("list:", sel(seq)), val}
+		return [][]byte{cmd, keyAt("list:", sel(conn, seq)), val}
 	}
 }
 
@@ -210,7 +210,7 @@ func SAdd(s Spec) load.CommandGen {
 	cmd := []byte("SADD")
 	return func(conn int, seq int64) [][]byte {
 		member := []byte("m" + strconv.FormatInt(seq, 10))
-		return [][]byte{cmd, keyAt("set:", sel(seq)), member}
+		return [][]byte{cmd, keyAt("set:", sel(conn, seq)), member}
 	}
 }
 
@@ -222,7 +222,7 @@ func ZAdd(s Spec) load.CommandGen {
 	return func(conn int, seq int64) [][]byte {
 		score := []byte(strconv.FormatInt(seq, 10))
 		member := []byte("m" + strconv.FormatInt(seq, 10))
-		return [][]byte{cmd, keyAt("zset:", sel(seq)), score, member}
+		return [][]byte{cmd, keyAt("zset:", sel(conn, seq)), score, member}
 	}
 }
 
@@ -234,7 +234,7 @@ func HSet(s Spec) load.CommandGen {
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
 		field := []byte("f" + strconv.FormatInt(seq%64, 10))
-		return [][]byte{cmd, keyAt("hash:", sel(seq)), field, val}
+		return [][]byte{cmd, keyAt("hash:", sel(conn, seq)), field, val}
 	}
 }
 
@@ -247,9 +247,9 @@ func MSet(s Spec) load.CommandGen {
 	return func(conn int, seq int64) [][]byte {
 		return [][]byte{
 			cmd,
-			keyAt("key:", sel(seq*3)), val,
-			keyAt("key:", sel(seq*3+1)), val,
-			keyAt("key:", sel(seq*3+2)), val,
+			keyAt("key:", sel(conn, seq*3)), val,
+			keyAt("key:", sel(conn, seq*3+1)), val,
+			keyAt("key:", sel(conn, seq*3+2)), val,
 		}
 	}
 }
@@ -268,9 +268,9 @@ func Mixed(s Spec) load.CommandGen {
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
 		if int(seq%100) < ratio {
-			return [][]byte{get, keyAt("key:", sel(seq))}
+			return [][]byte{get, keyAt("key:", sel(conn, seq))}
 		}
-		return [][]byte{set, keyAt("key:", sel(seq)), val}
+		return [][]byte{set, keyAt("key:", sel(conn, seq)), val}
 	}
 }
 

@@ -42,7 +42,7 @@ func LRange(s Spec) Plan {
 			return [][]byte{rpush, lk, memberName(seq)}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			start := windowStart(sel(seq), int64(s.Members))
+			start := windowStart(sel(conn, seq), int64(s.Members))
 			stop := start + rangeWindow - 1
 			return [][]byte{lrange, lk, intArg(start), intArg(stop)}
 		},
@@ -65,7 +65,7 @@ func ZRange(s Spec) Plan {
 			return [][]byte{zadd, zk, intArg(seq), memberName(seq)}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			start := windowStart(sel(seq), int64(s.Members))
+			start := windowStart(sel(conn, seq), int64(s.Members))
 			stop := start + rangeWindow - 1
 			return [][]byte{zrange, zk, intArg(start), intArg(stop)}
 		},
@@ -88,7 +88,7 @@ func ZRangeByScore(s Spec) Plan {
 			return [][]byte{zadd, zk, intArg(seq), memberName(seq)}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			lo := windowStart(sel(seq), int64(s.Members))
+			lo := windowStart(sel(conn, seq), int64(s.Members))
 			hi := lo + rangeWindow - 1
 			return [][]byte{zrangebyscore, zk, intArg(lo), intArg(hi)}
 		},
@@ -422,7 +422,7 @@ func LIndex(s Spec) Plan {
 			return [][]byte{rpush, lk, memberName(seq)}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{lindex, lk, intArg(sel(seq))}
+			return [][]byte{lindex, lk, intArg(sel(conn, seq))}
 		},
 	}
 }
