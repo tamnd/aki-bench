@@ -391,3 +391,90 @@ func TestComparisonCarriesCell(t *testing.T) {
 		}
 	}
 }
+
+func TestExpectedDistinctUniform(t *testing.T) {
+	// 2M draws over 1M keys: 1M*(1-e^-2) to within rounding.
+	got := ExpectedDistinctUniform(1000000, 2000000)
+	if got < 860000 || got > 870000 {
+		t.Fatalf("expected distinct for 2M draws over 1M keys = %.0f, want about 864665", got)
+	}
+	// Far more draws than keys approaches full coverage.
+	if got := ExpectedDistinctUniform(1000, 100000); got < 999.9 {
+		t.Fatalf("100k draws over 1k keys should cover almost everything, got %.2f", got)
+	}
+	if ExpectedDistinctUniform(0, 100) != 0 || ExpectedDistinctUniform(100, 0) != 0 {
+		t.Fatal("degenerate inputs should yield 0")
+	}
+}
+
+func TestWithKeyCoverageOmitsUntracked(t *testing.T) {
+	e := entry("aki", 100000, 50).WithKeyCoverage(0, 0)
+	if e.DistinctKeysEst != 0 || e.KeyDraws != 0 {
+		t.Fatal("zero draws means not tracked, fields must stay empty")
+	}
+	e = entry("aki", 100000, 50).WithKeyCoverage(40000, 2000000)
+	if e.DistinctKeysEst != 40000 || e.KeyDraws != 2000000 {
+		t.Fatalf("coverage not carried: distinct %d draws %d", e.DistinctKeysEst, e.KeyDraws)
+	}
+}
+
+// The table must call out a uniform row whose distinct-key count sits more
+// than 20% from the sampling expectation, and stay quiet when coverage
+// matches. This is the M0 re-run bug made visible in the run's own output.
+func TestWriteTableFlagsKeyspaceCoverage(t *testing.T) {
+	aki := entry("aki", 250000, 50).WithKeyCoverage(40000, 2000000)
+	redis := entry("redis", 100000, 60).WithKeyCoverage(864000, 2000000)
+	valkey := entry("valkey", 95000, 55) // untracked, must not be flagged
+	cmp := NewComparison("set", aki, redis, valkey, DefaultRequiredSpeedup)
+	cmp.Cell = Cell{Keyspace: 1000000, ValueSize: 64, Dist: "uniform", Pipeline: 1, Connections: 50}
+
+	var buf bytes.Buffer
+	cmp.WriteTable(&buf)
+	out := buf.String()
+	if !strings.Contains(out, "aki keyspace coverage: 40000 distinct of 1000000 keys") {
+		t.Fatalf("table should flag aki's 4.6%% coverage:\n%s", out)
+	}
+	if strings.Contains(out, "redis keyspace coverage") {
+		t.Fatalf("redis matched expectation and must not be flagged:\n%s", out)
+	}
+	if strings.Contains(out, "valkey keyspace coverage") {
+		t.Fatalf("untracked valkey must not be flagged:\n%s", out)
+	}
+}
+
+// A zipfian row revisits its head on purpose; the uniform expectation does not
+// apply and the table must not warn about it.
+func TestWriteTableCoverageSilentOnZipfian(t *testing.T) {
+	aki := entry("aki", 250000, 50).WithKeyCoverage(18000, 2000000)
+	redis := entry("redis", 100000, 60).WithKeyCoverage(18100, 2000000)
+	valkey := entry("valkey", 95000, 55).WithKeyCoverage(17900, 2000000)
+	cmp := NewComparison("set", aki, redis, valkey, DefaultRequiredSpeedup)
+	cmp.Cell = Cell{Keyspace: 1000000, ValueSize: 64, Dist: "zipfian", ZipfS: 0.99, Pipeline: 1, Connections: 50}
+
+	var buf bytes.Buffer
+	cmp.WriteTable(&buf)
+	if strings.Contains(buf.String(), "keyspace coverage") {
+		t.Fatalf("zipfian rows must not carry the uniform coverage note:\n%s", buf.String())
+	}
+}
+
+// The JSON row must carry the coverage figures so a sweep's artifacts are
+// auditable after the fact, and must omit them on untracked entries.
+func TestJSONCarriesDistinctKeys(t *testing.T) {
+	aki := entry("aki", 250000, 50).WithKeyCoverage(864000, 2000000)
+	redis := entry("redis", 100000, 60)
+	valkey := entry("valkey", 95000, 55)
+	cmp := NewComparison("set", aki, redis, valkey, DefaultRequiredSpeedup)
+
+	var buf bytes.Buffer
+	if err := cmp.WriteJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `"distinct_keys_est": 864000`) || !strings.Contains(out, `"key_draws": 2000000`) {
+		t.Fatalf("JSON missing coverage fields:\n%s", out)
+	}
+	if strings.Count(out, "distinct_keys_est") != 1 {
+		t.Fatalf("untracked entries must omit distinct_keys_est:\n%s", out)
+	}
+}
