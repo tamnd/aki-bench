@@ -26,7 +26,8 @@ type Entry struct {
 	Ops       int64   `json:"ops"`               // successful operations
 	Errors    int64   `json:"errors"`            // failed operations
 	OpsPerSec float64 `json:"ops_per_sec"`
-	P50us     float64 `json:"p50_us"` // latency percentiles in microseconds
+	MinUs     float64 `json:"min_us,omitempty"` // smallest recorded latency in microseconds
+	P50us     float64 `json:"p50_us"`           // latency percentiles in microseconds
 	P99us     float64 `json:"p99_us"`
 	P999us    float64 `json:"p999_us"`
 
@@ -73,6 +74,7 @@ func FromResult(targetName, workload string, r load.Result) Entry {
 		Ops:         r.Ops,
 		Errors:      r.Errors,
 		OpsPerSec:   r.OpsPerSec(),
+		MinUs:       toMicros(r.Hist.Min()),
 		P50us:       toMicros(r.Hist.ValueAtPercentile(50)),
 		P99us:       toMicros(r.Hist.ValueAtPercentile(99)),
 		P999us:      toMicros(r.Hist.ValueAtPercentile(99.9)),
@@ -133,6 +135,88 @@ type Comparison struct {
 	Redis     Entry     `json:"redis"`
 	Valkey    Entry     `json:"valkey"`
 	Gate      Gate      `json:"gate"`
+
+	// GeneratorBound marks a closed-loop row where the load generator, not any
+	// server, was the ceiling. Such a row measures the generator's capacity and
+	// must never be quoted as a server capacity number. See DetectGeneratorBound
+	// for the two conditions that set it; Note carries the evidence.
+	GeneratorBound     bool   `json:"generator_bound"`
+	GeneratorBoundNote string `json:"generator_bound_note,omitempty"`
+}
+
+// DefaultGeneratorBoundEpsilon is the relative throughput spread under which
+// three closed-loop targets count as "all landed at the same ceiling". Ten
+// percent is comfortably wider than run-to-run noise on a pinned box and far
+// narrower than any real capacity gap the gate cares about.
+const DefaultGeneratorBoundEpsilon = 0.10
+
+// identityTolerance is how far the closed-loop identity may miss and still
+// count as holding. In a saturated closed loop the fastest operation is one
+// that never queued anywhere but the loop itself, so min latency times
+// throughput reproduces the outstanding-request count almost exactly; on a
+// server-bound run the minimum is a genuinely fast service time and the
+// product lands far below outstanding. Half is a generous noise budget that
+// still separates the two regimes by an order of magnitude in practice.
+const identityTolerance = 0.5
+
+// DetectGeneratorBound decides whether a closed-loop row hit the load
+// generator's ceiling rather than any server's. Two independent signals must
+// both fire:
+//
+//  1. All three targets' throughputs fall within epsilon of each other. Three
+//     different servers do not tie by coincidence; they tie when something
+//     upstream of all of them is the bottleneck.
+//  2. The closed-loop latency identity holds on every target: the minimum
+//     observed latency times the throughput reproduces the outstanding-request
+//     count (connections times pipeline). When a closed loop saturates, even
+//     the fastest operation spends its whole life waiting on the loop, so
+//     min latency collapses to outstanding/throughput. A server-bound run
+//     breaks the identity because its minimum is a real service time.
+//
+// outstanding is connections times pipeline depth. The returned note carries
+// the numbers so the row explains itself. This is the check that catches the
+// redis-benchmark P16 c512 rows from the f3 M0 gate: all targets at ~2.1M
+// ops/s with min latency equal to outstanding/throughput, quoted as capacity
+// while the same server did 4.21M under a faster generator.
+func DetectGeneratorBound(aki, redis, valkey Entry, outstanding int, epsilon float64) (bool, string) {
+	if aki.Skipped || redis.Skipped || valkey.Skipped || outstanding <= 0 {
+		return false, ""
+	}
+	entries := []Entry{aki, redis, valkey}
+	lo, hi := entries[0].OpsPerSec, entries[0].OpsPerSec
+	for _, e := range entries {
+		if e.OpsPerSec <= 0 || e.MinUs <= 0 {
+			return false, ""
+		}
+		lo = min(lo, e.OpsPerSec)
+		hi = max(hi, e.OpsPerSec)
+	}
+
+	spread := (hi - lo) / hi
+	if spread > epsilon {
+		return false, ""
+	}
+
+	for _, e := range entries {
+		implied := e.MinUs / 1e6 * e.OpsPerSec // min latency in seconds times ops/s
+		ratio := implied / float64(outstanding)
+		if ratio < 1-identityTolerance || ratio > 1+identityTolerance {
+			return false, ""
+		}
+	}
+
+	return true, fmt.Sprintf(
+		"all targets within %.1f%% (%.0f to %.0f ops/s) and min latency times throughput reproduces the %d outstanding requests on every target; the load generator saturated, not the servers",
+		spread*100, lo, hi, outstanding)
+}
+
+// FlagGeneratorBound runs the generator-bound check against the row's own cell
+// shape and stamps the verdict into the comparison. Call it only for a
+// closed-loop run, after Cell is set: the identity it tests is a property of a
+// closed loop, and an open-loop run at a target rate ties on purpose.
+func (c *Comparison) FlagGeneratorBound(epsilon float64) {
+	outstanding := c.Cell.Connections * c.Cell.Pipeline
+	c.GeneratorBound, c.GeneratorBoundNote = DetectGeneratorBound(c.Aki, c.Redis, c.Valkey, outstanding, epsilon)
 }
 
 // Gate is the 2x acceptance verdict.
@@ -255,6 +339,9 @@ func (c Comparison) WriteTable(w io.Writer) {
 		verdict = "PASS"
 	}
 	fmt.Fprintf(w, "gate (%.1fx): %s, %s\n", c.Gate.Required, verdict, c.Gate.Reason)
+	if c.GeneratorBound {
+		fmt.Fprintf(w, "GENERATOR-BOUND: %s. This row is not a capacity measurement; do not quote it as one.\n", c.GeneratorBoundNote)
+	}
 }
 
 // WriteJSON emits the comparison as indented JSON for CI artifacts.

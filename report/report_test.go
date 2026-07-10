@@ -113,6 +113,105 @@ func TestWithMemoryDerivesBytesPerKey(t *testing.T) {
 	}
 }
 
+// genEntry builds a synthetic closed-loop row: a target at the given
+// throughput with the given minimum latency in microseconds.
+func genEntry(name string, ops, minUs float64) Entry {
+	e := entry(name, ops, minUs*4)
+	e.MinUs = minUs
+	return e
+}
+
+func TestDetectGeneratorBound(t *testing.T) {
+	// The f3 M0 gate shape: P16 c512, so 8192 outstanding requests. All three
+	// targets tie at ~2.1M ops/s and every minimum latency is exactly what the
+	// closed-loop identity predicts, outstanding/throughput. This is the
+	// redis-benchmark row that was quoted as capacity while the same server
+	// did 4.21M under a faster generator.
+	outstanding := 512 * 16
+	identityMin := func(ops float64) float64 { return float64(outstanding) / ops * 1e6 }
+
+	aki := genEntry("aki", 2.13e6, identityMin(2.13e6))
+	redis := genEntry("redis", 2.05e6, identityMin(2.05e6))
+	valkey := genEntry("valkey", 2.10e6, identityMin(2.10e6))
+
+	bound, note := DetectGeneratorBound(aki, redis, valkey, outstanding, DefaultGeneratorBoundEpsilon)
+	if !bound {
+		t.Fatal("a three-way tie satisfying the closed-loop identity must flag generator-bound")
+	}
+	if !strings.Contains(note, "8192") {
+		t.Fatalf("note should carry the outstanding count: %s", note)
+	}
+}
+
+func TestDetectGeneratorBoundServerBoundSpread(t *testing.T) {
+	// A genuine capacity row: aki at 4.21M while Redis and Valkey sit near
+	// 350k. The spread alone clears it, whatever the latencies say.
+	outstanding := 512 * 16
+	aki := genEntry("aki", 4.21e6, 100)
+	redis := genEntry("redis", 3.5e5, 120)
+	valkey := genEntry("valkey", 3.6e5, 115)
+	if bound, _ := DetectGeneratorBound(aki, redis, valkey, outstanding, DefaultGeneratorBoundEpsilon); bound {
+		t.Fatal("a 12x spread is a server-bound row, not a generator-bound one")
+	}
+}
+
+func TestDetectGeneratorBoundIdentityBroken(t *testing.T) {
+	// Three targets that happen to tie but whose minimum latencies are real
+	// service times far below outstanding/throughput. A coincidental tie with
+	// the identity broken must not be flagged: min*ops here is ~18, nowhere
+	// near the 8192 outstanding.
+	outstanding := 512 * 16
+	aki := genEntry("aki", 3.5e5, 50)
+	redis := genEntry("redis", 3.5e5, 52)
+	valkey := genEntry("valkey", 3.4e5, 51)
+	if bound, _ := DetectGeneratorBound(aki, redis, valkey, outstanding, DefaultGeneratorBoundEpsilon); bound {
+		t.Fatal("a tie without the closed-loop identity must not flag generator-bound")
+	}
+}
+
+func TestDetectGeneratorBoundNeedsAllTargets(t *testing.T) {
+	outstanding := 512 * 16
+	aki := genEntry("aki", 2.1e6, float64(outstanding)/2.1e6*1e6)
+	valkey := genEntry("valkey", 2.1e6, float64(outstanding)/2.1e6*1e6)
+	if bound, _ := DetectGeneratorBound(aki, Skipped("redis", "set"), valkey, outstanding, DefaultGeneratorBoundEpsilon); bound {
+		t.Fatal("a skipped target leaves the tie unproven, must not flag")
+	}
+	// Zero min latency means the identity cannot be tested, so no flag either.
+	if bound, _ := DetectGeneratorBound(entry("aki", 2.1e6, 50), entry("redis", 2.1e6, 50), entry("valkey", 2.1e6, 50), outstanding, DefaultGeneratorBoundEpsilon); bound {
+		t.Fatal("entries without a min latency cannot prove the identity, must not flag")
+	}
+}
+
+func TestFlagGeneratorBoundRendersMarker(t *testing.T) {
+	outstanding := 512 * 16
+	identityMin := func(ops float64) float64 { return float64(outstanding) / ops * 1e6 }
+	cmp := NewComparison("set",
+		genEntry("aki", 2.13e6, identityMin(2.13e6)),
+		genEntry("redis", 2.05e6, identityMin(2.05e6)),
+		genEntry("valkey", 2.10e6, identityMin(2.10e6)),
+		DefaultRequiredSpeedup,
+	)
+	cmp.Cell = Cell{Keyspace: 100000, ValueSize: 64, Dist: "uniform", Pipeline: 16, Connections: 512}
+	cmp.FlagGeneratorBound(DefaultGeneratorBoundEpsilon)
+	if !cmp.GeneratorBound {
+		t.Fatal("comparison should be flagged generator-bound")
+	}
+
+	var tbuf bytes.Buffer
+	cmp.WriteTable(&tbuf)
+	if !strings.Contains(tbuf.String(), "GENERATOR-BOUND") {
+		t.Fatalf("table missing the generator-bound marker:\n%s", tbuf.String())
+	}
+
+	var jbuf bytes.Buffer
+	if err := cmp.WriteJSON(&jbuf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jbuf.String(), "\"generator_bound\": true") {
+		t.Fatalf("json missing generator_bound:\n%s", jbuf.String())
+	}
+}
+
 func TestComparisonCarriesCell(t *testing.T) {
 	cmp := NewComparison("set",
 		entry("aki", 200000, 50),
