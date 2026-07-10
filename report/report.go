@@ -69,6 +69,31 @@ type Entry struct {
 	RSSBytes    int64   `json:"rss_bytes,omitempty"`
 	UsedMemory  int64   `json:"used_memory,omitempty"`
 	BytesPerKey float64 `json:"bytes_per_key,omitempty"`
+
+	// The server's own account of the measured window, from INFO deltas taken
+	// around the run: keyspace hits and misses, keys evicted, and the memory
+	// cap and policy in force. These corroborate the client-side reply split
+	// from the server's side; on an LTM row a rival's evicted_keys and misses
+	// are the proof that its nil answers were eviction losses, not client
+	// error. Omitted when the server does not serve INFO (f3srv). The window
+	// includes the warmup drive, which the client counters exclude, so the
+	// figures corroborate the split rather than reproducing it exactly.
+	ServerHits      int64  `json:"server_hits,omitempty"`
+	ServerMisses    int64  `json:"server_misses,omitempty"`
+	EvictedKeys     int64  `json:"evicted_keys,omitempty"`
+	Maxmemory       int64  `json:"maxmemory,omitempty"`
+	MaxmemoryPolicy string `json:"maxmemory_policy,omitempty"`
+}
+
+// WithEviction returns the entry carrying the server-side eviction and hit
+// accounting for the measured window, already delta'd by the caller.
+func (e Entry) WithEviction(window load.EvictionStats) Entry {
+	e.ServerHits = window.KeyspaceHits
+	e.ServerMisses = window.KeyspaceMisses
+	e.EvictedKeys = window.EvictedKeys
+	e.Maxmemory = window.Maxmemory
+	e.MaxmemoryPolicy = window.MaxmemoryPolicy
+	return e
 }
 
 // WithVersion returns the entry tagged with a server's self-reported identity,
@@ -391,6 +416,26 @@ func (c Comparison) WriteTable(w io.Writer) {
 			e.BytesPerSec/(1<<20), e.P50us, e.P99us, e.P999us, rss, note)
 	}
 	tw.Flush()
+
+	// Server-side corroboration lines: only for targets whose INFO answered,
+	// and only when there is something to say. An LTM row's rival prints its
+	// cap, policy, evictions, and misses here so the nils in the table above
+	// have their server-side explanation next to them.
+	for _, e := range []Entry{c.Aki, c.Redis, c.Valkey} {
+		if e.Skipped || (e.MaxmemoryPolicy == "" && e.EvictedKeys == 0 && e.ServerMisses == 0) {
+			continue
+		}
+		limit := "unlimited"
+		if e.Maxmemory > 0 {
+			limit = fmt.Sprintf("%.0f MB", float64(e.Maxmemory)/(1<<20))
+		}
+		policy := e.MaxmemoryPolicy
+		if policy == "" {
+			policy = "-"
+		}
+		fmt.Fprintf(w, "%s server window: maxmemory=%s policy=%s evicted=%d hits=%d misses=%d\n",
+			e.Target, limit, policy, e.EvictedKeys, e.ServerHits, e.ServerMisses)
+	}
 
 	if !c.Aki.Skipped && !c.Redis.Skipped {
 		fmt.Fprintf(w, "speedup vs redis:  %.2fx\n", c.Gate.SpeedupVsRedis)

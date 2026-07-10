@@ -360,6 +360,14 @@ func run(args []string) error {
 		} else {
 			fmt.Fprintf(os.Stderr, "version probe %s: %v\n", k, perr)
 		}
+		// Snapshot the server's cumulative hit/miss/eviction counters before the
+		// run so the post-run snapshot can be delta'd to the measured window.
+		// This is the server-side corroboration of the client's reply split: on
+		// an LTM row the rival's own misses and evicted_keys prove its nils were
+		// eviction losses. A server without INFO (f3srv) just leaves the columns
+		// empty. The window includes the warmup drive; these are diagnostics,
+		// not gated numbers.
+		preStats, preStatsErr := load.ProbeEvictionStats(t.Addr, 2*time.Second)
 		res, err := load.Run(context.Background(), cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "run %s: %v\n", k, err)
@@ -374,7 +382,13 @@ func run(args []string) error {
 		if memErr != nil {
 			usedMemory = 0
 		}
-		return report.FromResult(name, *wl, res).WithVersion(version).WithMemory(t.RSSBytes(), usedMemory, entries)
+		row := report.FromResult(name, *wl, res).WithVersion(version).WithMemory(t.RSSBytes(), usedMemory, entries)
+		if preStatsErr == nil {
+			if postStats, perr := load.ProbeEvictionStats(t.Addr, 2*time.Second); perr == nil {
+				row = row.WithEviction(postStats.Sub(preStats))
+			}
+		}
+		return row
 	}
 
 	cmp := report.NewComparison(*wl,
