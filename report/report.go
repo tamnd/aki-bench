@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"text/tabwriter"
 	"time"
 
@@ -69,6 +70,17 @@ type Entry struct {
 	RSSBytes    int64   `json:"rss_bytes,omitempty"`
 	UsedMemory  int64   `json:"used_memory,omitempty"`
 	BytesPerKey float64 `json:"bytes_per_key,omitempty"`
+
+	// DistinctKeysEst is how many distinct key-space indices the measured
+	// window actually selected (exact under a bitmap, a HyperLogLog estimate
+	// on giant spaces), and KeyDraws is how many selector draws produced
+	// them. Together they let a row self-report its keyspace coverage: the f3
+	// M0 re-run (tamnd/aki#542) found SET and INCR windows at -keys 1000000
+	// touching 50-90k distinct keys, which nothing in the output said. Both
+	// are omitted when the run did not track (older JSON, workloads whose
+	// probe draws no index).
+	DistinctKeysEst int64 `json:"distinct_keys_est,omitempty"`
+	KeyDraws        int64 `json:"key_draws,omitempty"`
 
 	// The server's own account of the measured window, from INFO deltas taken
 	// around the run: keyspace hits and misses, keys evicted, and the memory
@@ -141,6 +153,37 @@ func (e Entry) WithMemory(rss, usedMemory int64, keyspace int) Entry {
 	}
 	return e
 }
+
+// WithKeyCoverage returns the entry carrying the window's keyspace coverage:
+// the distinct-key estimate and the draw count it came from. Zero draws means
+// "not tracked" and leaves both columns out of the JSON.
+func (e Entry) WithKeyCoverage(distinct, draws int64) Entry {
+	if draws <= 0 {
+		return e
+	}
+	e.DistinctKeysEst = distinct
+	e.KeyDraws = draws
+	return e
+}
+
+// ExpectedDistinctUniform is the expected number of distinct slots that draws
+// uniform picks with replacement touch in a space of k slots:
+// k*(1-(1-1/k)^draws). This is the yardstick the coverage note compares
+// against; it only holds for the uniform access pattern, a zipfian window
+// deliberately revisits its head and has no such closed form worth checking.
+func ExpectedDistinctUniform(k int, draws int64) float64 {
+	if k <= 0 || draws <= 0 {
+		return 0
+	}
+	return float64(k) * (1 - math.Pow(1-1/float64(k), float64(draws)))
+}
+
+// coverageDeviationLimit is how far a uniform window's measured distinct-key
+// count may sit from the sampling expectation before the table calls it out.
+// Twenty percent is far beyond both sampling noise at window scale and the
+// HLL's estimation error, so a note here means the access pattern did not do
+// what the cell's name claims.
+const coverageDeviationLimit = 0.20
 
 // Skipped builds an Entry marking a target that was not run.
 func Skipped(targetName, workload string) Entry {
@@ -435,6 +478,32 @@ func (c Comparison) WriteTable(w io.Writer) {
 		}
 		fmt.Fprintf(w, "%s server window: maxmemory=%s policy=%s evicted=%d hits=%d misses=%d\n",
 			e.Target, limit, policy, e.EvictedKeys, e.ServerHits, e.ServerMisses)
+	}
+
+	// Keyspace coverage callout: only for tracked uniform rows, and only when
+	// the measured distinct-key count sits more than 20% from the sampling
+	// expectation. A quiet row means the window exercised the space its cell
+	// name claims; the JSON carries the raw figures either way.
+	if c.Cell.Dist == "uniform" {
+		space := c.Cell.Members
+		if space <= 0 {
+			space = c.Cell.Keyspace
+		}
+		for _, e := range []Entry{c.Aki, c.Redis, c.Valkey} {
+			if e.Skipped || e.KeyDraws <= 0 || space <= 0 {
+				continue
+			}
+			want := ExpectedDistinctUniform(space, e.KeyDraws)
+			if want <= 0 {
+				continue
+			}
+			dev := (float64(e.DistinctKeysEst) - want) / want
+			if math.Abs(dev) <= coverageDeviationLimit {
+				continue
+			}
+			fmt.Fprintf(w, "%s keyspace coverage: %d distinct of %d keys, expected %.0f for %d uniform draws (%+.0f%%)\n",
+				e.Target, e.DistinctKeysEst, space, want, e.KeyDraws, dev*100)
+		}
 	}
 
 	if !c.Aki.Skipped && !c.Redis.Skipped {
