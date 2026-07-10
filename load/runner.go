@@ -37,6 +37,17 @@ type Config struct {
 	TargetRate  int64         // open-loop aggregate target ops/sec, required in OpenLoop
 	DialTimeout time.Duration // per-connection dial timeout
 	Gen         CommandGen    // command source
+
+	// Warmup drives the exact connections the run will measure, untimed, for
+	// this long immediately before timing starts. Zero skips it. The point is
+	// thermal and power-state fairness: the first window a box serves after an
+	// idle gap runs on a rested CPU package with boost headroom the later
+	// windows never see, and since a harness measures its targets in a fixed
+	// order that rest lands on the same target every run. Warming every window
+	// with the same drive puts every target's measured seconds in the same hot
+	// regime. Nothing from the warmup reaches the result: its ops, errors,
+	// latencies, and wire bytes are all discarded.
+	Warmup time.Duration
 }
 
 func (c Config) withDefaults() Config {
@@ -105,6 +116,20 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		}
 	}()
 
+	// The warm drive runs before the measured timeout is created so it never
+	// eats into the timed window. It reuses the measured drive loops on the
+	// measured connections with throwaway counters and histograms, then the
+	// wire-byte baseline is snapshotted so warmup traffic is subtracted from
+	// the bytes/s column.
+	if cfg.Warmup > 0 {
+		warm(ctx, cfg, clients)
+	}
+	baseRead := make([]int64, len(clients))
+	baseWritten := make([]int64, len(clients))
+	for i, cl := range clients {
+		baseRead[i], baseWritten[i] = cl.BytesOnWire()
+	}
+
 	runCtx := ctx
 	var cancel context.CancelFunc
 	if cfg.Duration > 0 {
@@ -147,10 +172,10 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	var bytesRead, bytesWritten int64
-	for _, cl := range clients {
+	for i, cl := range clients {
 		r, w := cl.BytesOnWire()
-		bytesRead += r
-		bytesWritten += w
+		bytesRead += r - baseRead[i]
+		bytesWritten += w - baseWritten[i]
 	}
 
 	return Result{
@@ -162,6 +187,31 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		BytesRead:    bytesRead,
 		BytesWritten: bytesWritten,
 	}, nil
+}
+
+// warm drives every client with the run's own drive loop, in the run's own
+// mode, until the warmup deadline passes. Results go into throwaway counters
+// and histograms. A connection that errors during warmup just stops early; the
+// measured drive will surface the same failure on its own terms.
+func warm(ctx context.Context, cfg Config, clients []*Client) {
+	warmCtx, cancel := context.WithTimeout(ctx, cfg.Warmup)
+	defer cancel()
+
+	var ops, errs atomic.Int64
+	var wg sync.WaitGroup
+	for i, cl := range clients {
+		wg.Add(1)
+		go func(conn int, cl *Client) {
+			defer wg.Done()
+			h := NewLatencyHistogram()
+			if cfg.Mode == OpenLoop {
+				driveOpen(warmCtx, conn, cl, h, cfg, len(clients), 0, &ops, &errs)
+			} else {
+				driveClosed(warmCtx, conn, cl, h, cfg, 0, &ops, &errs)
+			}
+		}(i, cl)
+	}
+	wg.Wait()
 }
 
 // driveClosed runs one connection in closed-loop mode: send a pipeline batch,
