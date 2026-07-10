@@ -60,7 +60,7 @@ func HMGet(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    hashPreload(val),
 		Probe: func(conn int, seq int64) [][]byte {
-			start := windowStart(sel(seq), int64(s.Members))
+			start := windowStart(sel(conn, seq), int64(s.Members))
 			argv := make([][]byte, 0, 2+w)
 			argv = append(argv, hmget, hashProbeKey)
 			for i := range w {
@@ -83,7 +83,7 @@ func HExists(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    hashPreload(val),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{hexists, hashProbeKey, hashField(sel(seq))}
+			return [][]byte{hexists, hashProbeKey, hashField(sel(conn, seq))}
 		},
 	}
 }
@@ -116,7 +116,7 @@ func HStrlen(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    hashPreload(val),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{hstrlen, hashProbeKey, hashField(sel(seq))}
+			return [][]byte{hstrlen, hashProbeKey, hashField(sel(conn, seq))}
 		},
 	}
 }
@@ -169,7 +169,7 @@ func HSetField(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    hashPreload(val),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{hset, hashProbeKey, hashField(sel(seq)), val}
+			return [][]byte{hset, hashProbeKey, hashField(sel(conn, seq)), val}
 		},
 	}
 }
@@ -188,7 +188,7 @@ func HSetNX(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    hashPreload(val),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{hsetnx, hashProbeKey, hashField(sel(seq)), val}
+			return [][]byte{hsetnx, hashProbeKey, hashField(sel(conn, seq)), val}
 		},
 	}
 }
@@ -208,7 +208,7 @@ func HDel(s Spec) Plan {
 		PreloadOps: int64(s.Members),
 		Preload:    hashPreload(val),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{hdel, hashProbeKey, hashField(sel(seq))}
+			return [][]byte{hdel, hashProbeKey, hashField(sel(conn, seq))}
 		},
 	}
 }

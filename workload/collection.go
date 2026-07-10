@@ -51,7 +51,7 @@ func SISMember(s Spec) Plan {
 			return [][]byte{sadd, sk, memberName(seq)}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sismember, sk, memberName(sel(seq))}
+			return [][]byte{sismember, sk, memberName(sel(conn, seq))}
 		},
 	}
 }
@@ -71,7 +71,7 @@ func HGet(s Spec) Plan {
 			return [][]byte{hset, hk, field(seq), val}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{hget, hk, field(sel(seq))}
+			return [][]byte{hget, hk, field(sel(conn, seq))}
 		},
 	}
 }
@@ -89,7 +89,7 @@ func ZScore(s Spec) Plan {
 			return [][]byte{zadd, zk, []byte(strconv.FormatInt(seq, 10)), memberName(seq)}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{zscore, zk, memberName(sel(seq))}
+			return [][]byte{zscore, zk, memberName(sel(conn, seq))}
 		},
 	}
 }
@@ -109,7 +109,7 @@ func ZRank(s Spec) Plan {
 			return [][]byte{zadd, zk, []byte(strconv.FormatInt(seq, 10)), memberName(seq)}
 		},
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{zrank, zk, memberName(sel(seq))}
+			return [][]byte{zrank, zk, memberName(sel(conn, seq))}
 		},
 	}
 }

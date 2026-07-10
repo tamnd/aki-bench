@@ -2,27 +2,38 @@ package workload
 
 import "testing"
 
-// uniform must reproduce the old seq-mod-n behavior exactly, so existing runs are
-// unchanged when no -dist is passed.
-func TestUniformSelectorMatchesMod(t *testing.T) {
-	sel := uniformSelector(1000)
-	for _, seq := range []int64{0, 1, 999, 1000, 1001, 123456} {
-		if got, want := sel(seq), seq%1000; got != want {
-			t.Fatalf("uniform(%d) = %d, want %d", seq, got, want)
+// Uniform must spread evenly: over many draws every decile of the space gets
+// close to its fair share. This replaces the old seq-mod-n exactness check,
+// which pinned the very behavior that broke keyspace coverage across
+// connections (see coverage_test.go).
+func TestUniformSelectorIsEven(t *testing.T) {
+	const n = 1000
+	const draws = 200000
+	sel := uniformSelector(n)
+	var buckets [10]int
+	for seq := int64(0); seq < draws; seq++ {
+		buckets[sel(0, seq)*10/n]++
+	}
+	want := draws / 10
+	for i, c := range buckets {
+		if c < want*9/10 || c > want*11/10 {
+			t.Fatalf("decile %d got %d draws, want about %d", i, c, want)
 		}
 	}
 }
 
-// A selector must be a pure function of seq: the same seq always yields the same
-// index, on both uniform and zipfian. This is what keeps the access pattern
-// identical across the three engines.
+// A selector must be a pure function of (conn, seq): the same pair always
+// yields the same index, on both uniform and zipfian. This is what keeps the
+// access pattern identical across the three engines.
 func TestSelectorDeterministic(t *testing.T) {
 	for _, sel := range []Selector{uniformSelector(10000), zipfianSelector(10000, 0.99)} {
-		for _, seq := range []int64{0, 7, 42, 99999, 1 << 30} {
-			first := sel(seq)
-			for range 3 {
-				if got := sel(seq); got != first {
-					t.Fatalf("selector not deterministic at seq %d: %d then %d", seq, first, got)
+		for _, conn := range []int{0, 1, 49} {
+			for _, seq := range []int64{0, 7, 42, 99999, 1 << 30} {
+				first := sel(conn, seq)
+				for range 3 {
+					if got := sel(conn, seq); got != first {
+						t.Fatalf("selector not deterministic at conn %d seq %d: %d then %d", conn, seq, first, got)
+					}
 				}
 			}
 		}
@@ -33,10 +44,12 @@ func TestSelectorDeterministic(t *testing.T) {
 func TestSelectorInRange(t *testing.T) {
 	const n = 5000
 	for _, sel := range []Selector{uniformSelector(n), zipfianSelector(n, 1.1)} {
-		for seq := int64(0); seq < 100000; seq++ {
-			i := sel(seq)
-			if i < 0 || i >= n {
-				t.Fatalf("index %d out of range [0,%d) at seq %d", i, n, seq)
+		for conn := 0; conn < 4; conn++ {
+			for seq := int64(0); seq < 25000; seq++ {
+				i := sel(conn, seq)
+				if i < 0 || i >= n {
+					t.Fatalf("index %d out of range [0,%d) at conn %d seq %d", i, n, conn, seq)
+				}
 			}
 		}
 	}
@@ -53,10 +66,10 @@ func TestZipfianIsSkewed(t *testing.T) {
 	head := int64(n / 100) // top 1% of ranks
 	var zHead, uHead int
 	for seq := int64(0); seq < samples; seq++ {
-		if zsel(seq) < head {
+		if zsel(0, seq) < head {
 			zHead++
 		}
-		if usel(seq) < head {
+		if usel(0, seq) < head {
 			uHead++
 		}
 	}
@@ -80,7 +93,7 @@ func TestZipfianExponentMonotonic(t *testing.T) {
 		sel := zipfianSelector(n, s)
 		var c int
 		for seq := int64(0); seq < samples; seq++ {
-			if sel(seq) < head {
+			if sel(0, seq) < head {
 				c++
 			}
 		}

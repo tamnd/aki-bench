@@ -20,7 +20,7 @@ func XAdd(s Spec) load.CommandGen {
 	field := []byte("f")
 	val := value(s.ValueSize)
 	return func(conn int, seq int64) [][]byte {
-		return [][]byte{cmd, keyAt("stream:", sel(seq)), star, field, val}
+		return [][]byte{cmd, keyAt("stream:", sel(conn, seq)), star, field, val}
 	}
 }
 
