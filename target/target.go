@@ -196,6 +196,19 @@ func startupTail(buf *bytes.Buffer) string {
 	return "\nstartup output:\n" + string(bytes.TrimRight(b, "\n"))
 }
 
+// RSSBytes returns the launched server's current resident set size in bytes,
+// or 0 when it cannot be measured: connect mode has no PID to read, and off
+// Linux there is no /proc. RSS is half of the F14 memory column (doc 18
+// section 1.5): it travels next to used_memory so allocator slack or an
+// unsettled arena cannot hide behind the server's own accounting, and it is
+// the only memory figure available for a server that does not serve INFO.
+func (t *Target) RSSBytes() int64 {
+	if t.cmd == nil || t.cmd.Process == nil {
+		return 0
+	}
+	return rssBytes(t.cmd.Process.Pid)
+}
+
 // Close stops a launched server and removes its data directory. It is a no-op
 // for a connect-mode target. The Wait after Kill is bounded by a timeout so a
 // process wedged in uninterruptible I/O cannot hang the harness: across a

@@ -83,23 +83,24 @@ func main() {
 func run(args []string) error {
 	fs := flag.NewFlagSet("aki-bench", flag.ContinueOnError)
 	var (
-		wl          = fs.String("workload", "set", "workload name: "+strings.Join(allWorkloadNames(), ", "))
-		conns       = fs.Int("connections", 50, "concurrent connections")
-		pipeline    = fs.Int("pipeline", 1, "pipeline depth per connection")
-		durationStr = fs.String("duration", "5s", "run length, for example 10s; set to 0 to use -requests")
-		requests    = fs.Int64("requests", 0, "total requests when duration is 0")
-		valueSize   = fs.Int("value-size", 64, "write payload size in bytes")
-		keyCount    = fs.Int("keys", 100000, "key space size")
-		members     = fs.Int("members", 0, "member space for collection point-read workloads; defaults to -keys")
-		dist        = fs.String("dist", "uniform", "access pattern over the space: uniform or zipfian")
-		zipfS       = fs.Float64("zipf-s", 0.99, "zipfian skew exponent when -dist is zipfian")
-		readRatio   = fs.Int("read-ratio", 80, "read percent for the mixed workload")
-		openLoop    = fs.Bool("open-loop", false, "open-loop mode with coordinated-omission correction")
-		targetRate  = fs.Int64("rate", 0, "open-loop aggregate target ops/sec")
-		durable     = fs.Bool("durable", false, "launch servers in durable config instead of in-memory")
-		required    = fs.Float64("gate", report.DefaultRequiredSpeedup, "required speedup over Redis and Valkey")
-		jsonOut     = fs.String("json", "", "write the comparison JSON to this file")
-		smokeOnly   = fs.Bool("smoke", false, "run the compatibility smoke check instead of a load run")
+		wl           = fs.String("workload", "set", "workload name: "+strings.Join(allWorkloadNames(), ", "))
+		conns        = fs.Int("connections", 50, "concurrent connections")
+		pipeline     = fs.Int("pipeline", 1, "pipeline depth per connection")
+		durationStr  = fs.String("duration", "5s", "run length, for example 10s; set to 0 to use -requests")
+		requests     = fs.Int64("requests", 0, "total requests when duration is 0")
+		valueSizeTok = fs.String("value-size", "64", "write payload size: bytes, or a band token like 1k, 64k, 1m (binary multiples, so 1k is 1024)")
+		keyCount     = fs.Int("keys", 100000, "key space size")
+		members      = fs.Int("members", 0, "member space for collection point-read workloads; defaults to -keys")
+		card         = fs.String("card", "", "cardinality band preset from the doc 18 gate matrix: 1, 10, 10k, or 1M (any count token works); sets -members for a collection workload and -keys for a flat one, and is recorded in the result row as the band the cell ran at")
+		dist         = fs.String("dist", "uniform", "access pattern over the space: uniform or zipfian")
+		zipfS        = fs.Float64("zipf-s", 0.99, "zipfian skew exponent when -dist is zipfian")
+		readRatio    = fs.Int("read-ratio", 80, "read percent for the mixed workload")
+		openLoop     = fs.Bool("open-loop", false, "open-loop mode with coordinated-omission correction")
+		targetRate   = fs.Int64("rate", 0, "open-loop aggregate target ops/sec")
+		durable      = fs.Bool("durable", false, "launch servers in durable config instead of in-memory")
+		required     = fs.Float64("gate", report.DefaultRequiredSpeedup, "required speedup over Redis and Valkey")
+		jsonOut      = fs.String("json", "", "write the comparison JSON to this file")
+		smokeOnly    = fs.Bool("smoke", false, "run the compatibility smoke check instead of a load run")
 
 		akiAddr    = fs.String("aki-addr", "", "connect to a running aki at host:port instead of launching")
 		redisAddr  = fs.String("redis-addr", "", "connect to a running redis at host:port instead of launching")
@@ -137,6 +138,11 @@ func run(args []string) error {
 	duration, err := time.ParseDuration(*durationStr)
 	if err != nil {
 		return fmt.Errorf("bad -duration: %w", err)
+	}
+
+	valueSize, err := workload.ParseSize(*valueSizeTok)
+	if err != nil {
+		return fmt.Errorf("bad -value-size: %w", err)
 	}
 
 	dur := target.InMemory
@@ -208,7 +214,7 @@ func run(args []string) error {
 
 	spec := workload.Spec{
 		Name:      *wl,
-		ValueSize: *valueSize,
+		ValueSize: valueSize,
 		KeyCount:  *keyCount,
 		Members:   *members,
 		Dist:      *dist,
@@ -219,6 +225,22 @@ func run(args []string) error {
 		return fmt.Errorf("unknown -dist %q, choose uniform or zipfian", *dist)
 	}
 
+	// The cardinality band is one flag that lands on the right axis for the
+	// workload's shape: a collection plan's cardinality is its member count, a
+	// flat workload's is its key space (strings have no collection cardinality,
+	// so the doc 18 R1 ladder becomes a keyspace ladder for them).
+	if *card != "" {
+		n, err := workload.ParseCount(*card)
+		if err != nil {
+			return fmt.Errorf("bad -card: %w", err)
+		}
+		if isPlanWorkload(*wl) {
+			spec.Members = n
+		} else {
+			spec.KeyCount = n
+		}
+	}
+
 	// A workload is either a flat generator (get/set/...) or a collection
 	// point-read plan (sismember/hget/zscore/zrank). A plan has a preload phase
 	// that builds the single probed collection before the measured reads.
@@ -226,6 +248,20 @@ func run(args []string) error {
 	plan, isPlan := workload.BuildPlan(*wl, spec)
 	if gen == nil && !isPlan {
 		return fmt.Errorf("unknown workload %q, choose one of %s", *wl, strings.Join(allWorkloadNames(), ", "))
+	}
+
+	// The population the memory columns are divided by: a collection plan holds
+	// its entries as members of the one probed collection, a flat workload as
+	// keys. Members defaults to the key count when unset, matching the
+	// workload package's own defaulting.
+	entries := spec.KeyCount
+	cellMembers := 0
+	if isPlan {
+		cellMembers = spec.Members
+		if cellMembers <= 0 {
+			cellMembers = spec.KeyCount
+		}
+		entries = cellMembers
 	}
 
 	mode := load.ClosedLoop
@@ -313,7 +349,16 @@ func run(args []string) error {
 			fmt.Fprintf(os.Stderr, "run %s: %v\n", k, err)
 			return report.Skipped(name, *wl).WithVersion(version)
 		}
-		return report.FromResult(name, *wl, res).WithVersion(version)
+		// The F14 memory columns, probed right after the measured window so the
+		// footprint reflects the dataset the run built. A server that does not
+		// serve INFO (f3srv in M0) keeps its used_memory column empty rather
+		// than carrying a fake zero; RSS comes from the launcher's PID and is
+		// empty in connect mode and off Linux.
+		usedMemory, memErr := load.ProbeUsedMemory(t.Addr, 2*time.Second)
+		if memErr != nil {
+			usedMemory = 0
+		}
+		return report.FromResult(name, *wl, res).WithVersion(version).WithMemory(t.RSSBytes(), usedMemory, entries)
 	}
 
 	cmp := report.NewComparison(*wl,
@@ -322,6 +367,21 @@ func run(args []string) error {
 		entry(target.Valkey, "valkey"),
 		*required,
 	)
+	// The cell tuple travels with the result so a row is quotable as the shape
+	// it measured: the f1 campaign gated everything at one shape and the size
+	// axis stayed invisible until the postmortem.
+	cmp.Cell = report.Cell{
+		CardBand:    *card,
+		Keyspace:    spec.KeyCount,
+		Members:     cellMembers,
+		ValueSize:   valueSize,
+		Dist:        *dist,
+		Pipeline:    *pipeline,
+		Connections: *conns,
+	}
+	if *dist == "zipfian" {
+		cmp.Cell.ZipfS = *zipfS
+	}
 	cmp.WriteTable(os.Stdout)
 
 	if *jsonOut != "" {
@@ -412,6 +472,18 @@ func applyCPUSplit(enabled bool, serverList, clientList string, launching bool) 
 // collection point-read plans.
 func allWorkloadNames() []string {
 	return append(append([]string{}, workload.Names()...), workload.PlanNames()...)
+}
+
+// isPlanWorkload reports whether name is a collection point-read plan, which is
+// what decides where the -card preset lands: a plan's cardinality is its member
+// count, a flat workload's is its key space.
+func isPlanWorkload(name string) bool {
+	for _, n := range workload.PlanNames() {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 func runSmoke(targets map[target.Kind]*target.Target, stringsOnly bool) error {

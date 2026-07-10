@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/tamnd/aki-bench/load"
 )
 
 func entry(name string, ops, p99 float64) Entry {
@@ -78,5 +81,61 @@ func TestWriteTableAndJSON(t *testing.T) {
 	}
 	if !strings.Contains(jbuf.String(), "\"gate\"") {
 		t.Fatalf("json missing gate field:\n%s", jbuf.String())
+	}
+}
+
+func TestEntryCarriesBandwidthAndProtocol(t *testing.T) {
+	res := load.Result{Ops: 100, Elapsed: time.Second, Hist: load.NewLatencyHistogram(),
+		BytesRead: 5000, BytesWritten: 7000}
+	e := FromResult("aki", "set", res)
+	if e.BytesPerSec != 12000 {
+		t.Fatalf("bytes_per_sec = %.0f, want 12000", e.BytesPerSec)
+	}
+	if e.RespVer != 2 {
+		t.Fatalf("resp_ver = %d, want 2 (the client never negotiates RESP3)", e.RespVer)
+	}
+}
+
+func TestWithMemoryDerivesBytesPerKey(t *testing.T) {
+	e := entry("aki", 100000, 50).WithMemory(1<<28, 2048000, 1000)
+	if e.RSSBytes != 1<<28 || e.UsedMemory != 2048000 {
+		t.Fatalf("memory columns lost: rss %d used %d", e.RSSBytes, e.UsedMemory)
+	}
+	if e.BytesPerKey != 2048 {
+		t.Fatalf("bytes_per_key = %.1f, want 2048", e.BytesPerKey)
+	}
+
+	// Unmeasured accounting must leave the derived figure empty, never derive
+	// it from RSS, whose allocator slack would inflate it.
+	e = entry("aki", 100000, 50).WithMemory(1<<28, 0, 1000)
+	if e.BytesPerKey != 0 {
+		t.Fatalf("bytes_per_key must stay empty without used_memory, got %.1f", e.BytesPerKey)
+	}
+}
+
+func TestComparisonCarriesCell(t *testing.T) {
+	cmp := NewComparison("set",
+		entry("aki", 200000, 50),
+		entry("redis", 100000, 60),
+		entry("valkey", 95000, 55),
+		DefaultRequiredSpeedup,
+	)
+	cmp.Cell = Cell{CardBand: "10k", Keyspace: 10000, ValueSize: 1024,
+		Dist: "zipfian", ZipfS: 0.99, Pipeline: 16, Connections: 512}
+
+	var tbuf bytes.Buffer
+	cmp.WriteTable(&tbuf)
+	if !strings.Contains(tbuf.String(), "card=10k") || !strings.Contains(tbuf.String(), "value=1024B") {
+		t.Fatalf("table missing the cell line:\n%s", tbuf.String())
+	}
+
+	var jbuf bytes.Buffer
+	if err := cmp.WriteJSON(&jbuf); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"\"card_band\": \"10k\"", "\"value_size\": 1024", "\"zipf_s\": 0.99"} {
+		if !strings.Contains(jbuf.String(), want) {
+			t.Fatalf("json missing %s:\n%s", want, jbuf.String())
+		}
 	}
 }

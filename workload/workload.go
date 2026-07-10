@@ -307,8 +307,10 @@ func PreloadFor(name string, s Spec) (load.CommandGen, int64, bool) {
 	}
 }
 
-// ValueSizeSweep is the default set of payload sizes to sweep.
-func ValueSizeSweep() []int { return []int{16, 64, 256, 1024, 4096} }
+// ValueSizeSweep is the default set of payload sizes to sweep. It runs to 1MiB
+// per the doc 18 value axis: 64KiB and 1MiB are the giant-value rows where the
+// streaming reply path and the bandwidth ceiling (CF20) become the story.
+func ValueSizeSweep() []int { return []int{16, 64, 256, 1024, 4096, 64 * 1024, 1 << 20} }
 
 // KeySweep is the default set of key counts to sweep. The last entry is
 // deliberately large so a run with small values still produces a dataset that

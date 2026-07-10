@@ -164,3 +164,36 @@ func asDialError(err error, target **load.DialError) bool {
 	}
 	return false
 }
+
+func TestRunCountsWireBytes(t *testing.T) {
+	srv, err := newFakeServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	gen := workload.Set(workload.Spec{ValueSize: 64, KeyCount: 100})
+	res, err := load.Run(context.Background(), load.Config{
+		Addr:        srv.addr(),
+		Connections: 2,
+		Pipeline:    4,
+		Requests:    400,
+		Gen:         gen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every SET frame carries at least its 64-byte payload on the way out and a
+	// +OK\r\n on the way back, so the wire totals are bounded below by the op
+	// count. This is the CF20 bytes/s column's source; a zero here would mean a
+	// bandwidth-bound giant-value cell could pass as a throughput tie unseen.
+	if res.BytesWritten < res.Ops*64 {
+		t.Fatalf("bytes written %d too low for %d ops of 64B values", res.BytesWritten, res.Ops)
+	}
+	if res.BytesRead < res.Ops*5 {
+		t.Fatalf("bytes read %d too low for %d +OK replies", res.BytesRead, res.Ops)
+	}
+	if res.BytesPerSec() <= 0 {
+		t.Fatal("expected positive wire bandwidth")
+	}
+}
