@@ -165,6 +165,45 @@ func asDialError(err error, target **load.DialError) bool {
 	return false
 }
 
+func TestRunWarmupExcludedFromResult(t *testing.T) {
+	srv, err := newFakeServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	gen := workload.Set(workload.Spec{ValueSize: 64, KeyCount: 100})
+	res, err := load.Run(context.Background(), load.Config{
+		Addr:        srv.addr(),
+		Connections: 2,
+		Pipeline:    4,
+		Requests:    400,
+		Warmup:      100 * time.Millisecond,
+		Gen:         gen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The warm drive hammers the fake server for 100ms before timing starts,
+	// which is thousands of extra operations on this loopback path. None of
+	// them may leak into the result: the op count, the histogram, and the wire
+	// bytes must all describe exactly the 400 measured requests.
+	if res.Ops != 400 {
+		t.Fatalf("ops %d, want exactly the 400 measured requests", res.Ops)
+	}
+	if res.Hist.TotalCount() != res.Ops {
+		t.Fatalf("histogram count %d != ops %d, warmup samples leaked", res.Hist.TotalCount(), res.Ops)
+	}
+	// A SET frame is under 200 wire bytes here, so measured writes stay well
+	// below this cap; 100ms of warmup traffic on loopback would blow past it.
+	if res.BytesWritten > res.Ops*200 {
+		t.Fatalf("bytes written %d too high for %d ops, warmup bytes leaked", res.BytesWritten, res.Ops)
+	}
+	if res.Errors != 0 {
+		t.Fatalf("expected no errors, got %d", res.Errors)
+	}
+}
+
 func TestRunCountsWireBytes(t *testing.T) {
 	srv, err := newFakeServer()
 	if err != nil {
