@@ -205,6 +205,46 @@ func TestRunWarmupExcludedFromResult(t *testing.T) {
 	}
 }
 
+// AfterWarmup must fire exactly once, between the warmup drive and the
+// measured window: it is how the workload's distinct-key tracker discards what
+// warmup touched, so a hook that fires early, late, or not at all silently
+// corrupts the coverage figure.
+func TestRunAfterWarmupHook(t *testing.T) {
+	srv, err := newFakeServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	tr := workload.NewTracker(100)
+	gen := workload.Set(workload.Spec{ValueSize: 64, KeyCount: 100, Track: tr})
+	calls := 0
+	res, err := load.Run(context.Background(), load.Config{
+		Addr:        srv.addr(),
+		Connections: 2,
+		Pipeline:    4,
+		Requests:    400,
+		Warmup:      100 * time.Millisecond,
+		Gen:         gen,
+		AfterWarmup: func() {
+			calls++
+			tr.Reset()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("AfterWarmup ran %d times, want once", calls)
+	}
+	// After the reset the tracker holds only the measured window: 100ms of
+	// warmup on loopback issues far more than 400 ops, so an unreset tracker
+	// would carry warmup draws here.
+	if got := tr.Draws(); got != res.Ops {
+		t.Fatalf("tracker draws %d != measured ops %d, warmup draws leaked", got, res.Ops)
+	}
+}
+
 func TestRunCountsWireBytes(t *testing.T) {
 	srv, err := newFakeServer()
 	if err != nil {
