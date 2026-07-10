@@ -212,6 +212,125 @@ func TestFlagGeneratorBoundRendersMarker(t *testing.T) {
 	}
 }
 
+// valueEntry builds a row the way FromResult does after the counter split:
+// raw ops/s plus a value-bearing figure derived from a hit ratio.
+func valueEntry(name string, ops float64, hit float64, p99 float64) Entry {
+	e := entry(name, ops, p99)
+	total := int64(ops) // one second's worth, good enough for ratios
+	e.NilReplies = int64(float64(total) * (1 - hit))
+	e.ValueOpsPerSec = ops * hit
+	e.HitRatio = hit
+	return e
+}
+
+func TestGateComparesValueBearingThroughput(t *testing.T) {
+	// The f3 M0 LTM shape: the rival posts a huge raw ops/s but two thirds of
+	// its replies are nils for evicted keys, while aki answers everything with
+	// data. Raw ops/s says aki lost 0.01x; value-bearing ops/s is the honest
+	// comparison and the gate must use it.
+	aki := valueEntry("aki", 40000, 1.0, 50)
+	redis := valueEntry("redis", 4850000, 0.30, 60)
+	valkey := valueEntry("valkey", 4150000, 0.30, 55)
+
+	g := EvaluateGate(aki, redis, valkey, DefaultRequiredSpeedup)
+	wantVsRedis := 40000.0 / (4850000 * 0.30)
+	if diff := g.SpeedupVsRedis - wantVsRedis; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("speedup vs redis = %f, want value-bearing ratio %f", g.SpeedupVsRedis, wantVsRedis)
+	}
+	if g.Pass {
+		t.Fatalf("0.027x is still a fail: %s", g.Reason)
+	}
+}
+
+func TestGateRivalWithZeroValueOps(t *testing.T) {
+	// A rival that answered every GET with a nil served nothing. The gate must
+	// not divide by zero (Inf cannot marshal to JSON) and must not credit the
+	// nils; aki clears the bar over that rival by default.
+	aki := valueEntry("aki", 200000, 1.0, 50)
+	redis := valueEntry("redis", 5000000, 0.0, 60)
+	valkey := valueEntry("valkey", 90000, 1.0, 55)
+
+	g := EvaluateGate(aki, redis, valkey, DefaultRequiredSpeedup)
+	if !g.Pass {
+		t.Fatalf("expected pass, got: %s", g.Reason)
+	}
+	if g.SpeedupVsRedis != 0 {
+		t.Fatalf("speedup vs an all-nil rival must stay 0, not Inf: %f", g.SpeedupVsRedis)
+	}
+
+	var jbuf bytes.Buffer
+	cmp := NewComparison("get", aki, redis, valkey, DefaultRequiredSpeedup)
+	if err := cmp.WriteJSON(&jbuf); err != nil {
+		t.Fatalf("json must marshal cleanly with a zero-value-ops rival: %v", err)
+	}
+}
+
+func TestGateFailsWhenAkiServesOnlyNils(t *testing.T) {
+	aki := valueEntry("aki", 200000, 0.0, 50)
+	redis := valueEntry("redis", 100000, 1.0, 60)
+	valkey := valueEntry("valkey", 95000, 1.0, 55)
+	if g := EvaluateGate(aki, redis, valkey, DefaultRequiredSpeedup); g.Pass {
+		t.Fatalf("aki with zero value-bearing ops must fail: %s", g.Reason)
+	}
+}
+
+func TestGateLegacyEntriesFallBackToRawOps(t *testing.T) {
+	// Entries with no reply split (old JSON, hand-built rows) must gate exactly
+	// as before on raw ops/s.
+	aki := entry("aki", 200000, 50)
+	redis := entry("redis", 100000, 60)
+	valkey := entry("valkey", 95000, 55)
+	g := EvaluateGate(aki, redis, valkey, DefaultRequiredSpeedup)
+	if !g.Pass || g.SpeedupVsRedis != 2.0 {
+		t.Fatalf("legacy entries must gate on ops/s: pass=%v speedup=%f", g.Pass, g.SpeedupVsRedis)
+	}
+}
+
+func TestFromResultCarriesReplySplit(t *testing.T) {
+	res := load.Result{Ops: 400, NilReplies: 100, ErrReplies: 100,
+		Elapsed: time.Second, Hist: load.NewLatencyHistogram()}
+	e := FromResult("redis", "get", res)
+	if e.NilReplies != 100 || e.ErrReplies != 100 {
+		t.Fatalf("reply split lost: nil %d err %d", e.NilReplies, e.ErrReplies)
+	}
+	if e.HitRatio != 0.5 {
+		t.Fatalf("hit_ratio = %f, want 0.5", e.HitRatio)
+	}
+	if e.ValueOpsPerSec != 200 {
+		t.Fatalf("value_ops_per_sec = %f, want 200", e.ValueOpsPerSec)
+	}
+
+	// The four fields must always appear in the JSON, even at zero, because
+	// their absence is what hid the M0 LTM nil-serving in the first place.
+	cmp := NewComparison("get", e, e, e, DefaultRequiredSpeedup)
+	var jbuf bytes.Buffer
+	if err := cmp.WriteJSON(&jbuf); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"\"nil_replies\"", "\"err_replies\"", "\"hit_ratio\"", "\"value_ops_per_sec\""} {
+		if !strings.Contains(jbuf.String(), want) {
+			t.Fatalf("json missing %s:\n%s", want, jbuf.String())
+		}
+	}
+}
+
+func TestWriteTableShowsValueColumnsAndNotes(t *testing.T) {
+	aki := valueEntry("aki", 40000, 1.0, 50)
+	redis := valueEntry("redis", 4850000, 0.30, 60)
+	valkey := valueEntry("valkey", 4150000, 0.30, 55)
+	cmp := NewComparison("get", aki, redis, valkey, DefaultRequiredSpeedup)
+
+	var tbuf bytes.Buffer
+	cmp.WriteTable(&tbuf)
+	out := tbuf.String()
+	if !strings.Contains(out, "vops/sec") || !strings.Contains(out, "hit%") {
+		t.Fatalf("table missing the value columns:\n%s", out)
+	}
+	if !strings.Contains(out, "nil") {
+		t.Fatalf("table note should call out the nil replies:\n%s", out)
+	}
+}
+
 func TestComparisonCarriesCell(t *testing.T) {
 	cmp := NewComparison("set",
 		entry("aki", 200000, 50),

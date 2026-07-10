@@ -23,13 +23,27 @@ type Entry struct {
 	Version   string  `json:"version,omitempty"` // server's self-reported identity, e.g. "redis 8.8.0"
 	Workload  string  `json:"workload"`          // workload name
 	Skipped   bool    `json:"skipped"`           // true when the target was absent
-	Ops       int64   `json:"ops"`               // successful operations
-	Errors    int64   `json:"errors"`            // failed operations
+	Ops       int64   `json:"ops"`               // completed operations, whatever the reply carried
+	Errors    int64   `json:"errors"`            // transport and protocol failures
 	OpsPerSec float64 `json:"ops_per_sec"`
 	MinUs     float64 `json:"min_us,omitempty"` // smallest recorded latency in microseconds
 	P50us     float64 `json:"p50_us"`           // latency percentiles in microseconds
 	P99us     float64 `json:"p99_us"`
 	P999us    float64 `json:"p999_us"`
+
+	// NilReplies and ErrReplies split the completed operations by what came
+	// back: a RESP null (the server answered with no data, a miss on a read
+	// workload) and a server error reply (the command was refused). HitRatio
+	// is the value-bearing fraction of completed ops and ValueOpsPerSec is
+	// the throughput of only those ops. These four are never omitted from the
+	// JSON, because their whole point is making a nil-serving row visible: an
+	// engine under an allkeys eviction cap answers nil at RAM speed for every
+	// evicted key, and without the split that reads as throughput. The gate
+	// compares value-bearing throughput, not raw ops/s.
+	NilReplies     int64   `json:"nil_replies"`
+	ErrReplies     int64   `json:"err_replies"`
+	HitRatio       float64 `json:"hit_ratio"`
+	ValueOpsPerSec float64 `json:"value_ops_per_sec"`
 
 	// BytesPerSec is the wire bandwidth the run moved against this target, both
 	// directions summed. It is the CF19/CF20 column: a giant-value cell where
@@ -69,17 +83,21 @@ func (e Entry) WithVersion(v string) Entry {
 // FromResult builds an Entry from a load.Result.
 func FromResult(targetName, workload string, r load.Result) Entry {
 	return Entry{
-		Target:      targetName,
-		Workload:    workload,
-		Ops:         r.Ops,
-		Errors:      r.Errors,
-		OpsPerSec:   r.OpsPerSec(),
-		MinUs:       toMicros(r.Hist.Min()),
-		P50us:       toMicros(r.Hist.ValueAtPercentile(50)),
-		P99us:       toMicros(r.Hist.ValueAtPercentile(99)),
-		P999us:      toMicros(r.Hist.ValueAtPercentile(99.9)),
-		BytesPerSec: r.BytesPerSec(),
-		RespVer:     2, // the load client never negotiates RESP3; see the field doc
+		Target:         targetName,
+		Workload:       workload,
+		Ops:            r.Ops,
+		Errors:         r.Errors,
+		NilReplies:     r.NilReplies,
+		ErrReplies:     r.ErrReplies,
+		HitRatio:       r.HitRatio(),
+		ValueOpsPerSec: r.ValueOpsPerSec(),
+		OpsPerSec:      r.OpsPerSec(),
+		MinUs:          toMicros(r.Hist.Min()),
+		P50us:          toMicros(r.Hist.ValueAtPercentile(50)),
+		P99us:          toMicros(r.Hist.ValueAtPercentile(99)),
+		P999us:         toMicros(r.Hist.ValueAtPercentile(99.9)),
+		BytesPerSec:    r.BytesPerSec(),
+		RespVer:        2, // the load client never negotiates RESP3; see the field doc
 	}
 }
 
@@ -233,13 +251,30 @@ type Gate struct {
 // DefaultRequiredSpeedup is the project goal: 2x the current Redis and Valkey.
 const DefaultRequiredSpeedup = 2.0
 
+// gateOpsPerSec is the throughput the gate compares: value-bearing ops/s. A
+// nil reply moves no data and a server error reply completed no command, so
+// neither may earn gate credit; the M0 LTM cell showed why, with capped rivals
+// answering nil for two thirds of the GETs at RAM speed while aki paid a disk
+// read for every value it had kept. Entries built before the counter split
+// (hand-assembled tests, old JSON) carry no value figure; for them the raw
+// ops/s stands, which is also exact whenever every reply carried data.
+func (e Entry) gateOpsPerSec() float64 {
+	if e.NilReplies > 0 || e.ErrReplies > 0 || e.ValueOpsPerSec > 0 {
+		return e.ValueOpsPerSec
+	}
+	return e.OpsPerSec
+}
+
 // EvaluateGate is the exact acceptance gate.
 // It returns pass only when aki, Redis, and Valkey were all measured (none
-// skipped), aki's throughput is at least required times each of Redis and
-// Valkey, and aki's p99 latency is not worse than either competitor on the same
-// workload.
+// skipped), aki's value-bearing throughput is at least required times each of
+// Redis and Valkey, and aki's p99 latency is not worse than either competitor
+// on the same workload.
 // Requiring all three present is deliberate: a gate that "passes" because a
-// competitor was missing would be meaningless.
+// competitor was missing would be meaningless. A rival whose completed ops
+// were all nils or refusals has zero value-bearing throughput; the bar over
+// that rival counts as cleared (it served nothing to beat) and the verdict
+// says so, rather than dividing by zero or crediting the nils.
 func EvaluateGate(aki, redis, valkey Entry, required float64) Gate {
 	g := Gate{Required: required}
 
@@ -248,21 +283,33 @@ func EvaluateGate(aki, redis, valkey Entry, required float64) Gate {
 		g.Reason = "one or more targets were skipped, gate needs aki, redis, and valkey present"
 		return g
 	}
+	akiOps := aki.gateOpsPerSec()
+	redisOps := redis.gateOpsPerSec()
+	valkeyOps := valkey.gateOpsPerSec()
 	if aki.OpsPerSec <= 0 || redis.OpsPerSec <= 0 || valkey.OpsPerSec <= 0 {
 		g.Pass = false
 		g.Reason = "a target reported zero throughput"
 		return g
 	}
+	if akiOps <= 0 {
+		g.Pass = false
+		g.Reason = "aki reported zero value-bearing throughput"
+		return g
+	}
 
-	g.SpeedupVsRedis = aki.OpsPerSec / redis.OpsPerSec
-	g.SpeedupVsValkey = aki.OpsPerSec / valkey.OpsPerSec
+	if redisOps > 0 {
+		g.SpeedupVsRedis = akiOps / redisOps
+	}
+	if valkeyOps > 0 {
+		g.SpeedupVsValkey = akiOps / valkeyOps
+	}
 	g.TailRegressedRedis = aki.P99us > redis.P99us
 	g.TailRegressedValk = aki.P99us > valkey.P99us
 
 	switch {
-	case g.SpeedupVsRedis < required:
+	case redisOps > 0 && g.SpeedupVsRedis < required:
 		g.Reason = fmt.Sprintf("aki is %.2fx Redis, below the %.1fx bar", g.SpeedupVsRedis, required)
-	case g.SpeedupVsValkey < required:
+	case valkeyOps > 0 && g.SpeedupVsValkey < required:
 		g.Reason = fmt.Sprintf("aki is %.2fx Valkey, below the %.1fx bar", g.SpeedupVsValkey, required)
 	case g.TailRegressedRedis:
 		g.Reason = "aki p99 latency is worse than Redis"
@@ -270,8 +317,11 @@ func EvaluateGate(aki, redis, valkey Entry, required float64) Gate {
 		g.Reason = "aki p99 latency is worse than Valkey"
 	default:
 		g.Pass = true
-		g.Reason = fmt.Sprintf("aki is %.2fx Redis and %.2fx Valkey with no tail regression",
+		g.Reason = fmt.Sprintf("aki is %.2fx Redis and %.2fx Valkey on value-bearing ops/s with no tail regression",
 			g.SpeedupVsRedis, g.SpeedupVsValkey)
+		if redisOps <= 0 || valkeyOps <= 0 {
+			g.Reason = "a rival served no value-bearing ops (all nils or refusals); aki clears its bar by default"
+		}
 	}
 	return g
 }
@@ -305,26 +355,40 @@ func (c Comparison) WriteTable(w io.Writer) {
 			c.Cell.Dist, zipfNote, c.Cell.Pipeline, c.Cell.Connections)
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "target\tversion\tops/sec\tMB/s\tp50 us\tp99 us\tp999 us\trss MB\tnote")
+	fmt.Fprintln(tw, "target\tversion\tops/sec\tvops/sec\thit%\tMB/s\tp50 us\tp99 us\tp999 us\trss MB\tnote")
 	for _, e := range []Entry{c.Aki, c.Redis, c.Valkey} {
 		ver := e.Version
 		if ver == "" {
 			ver = "-"
 		}
 		if e.Skipped {
-			fmt.Fprintf(tw, "%s\t%s\t-\t-\t-\t-\t-\t-\tskipped\n", e.Target, ver)
+			fmt.Fprintf(tw, "%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\tskipped\n", e.Target, ver)
 			continue
 		}
-		note := ""
+		var notes []string
 		if e.Errors > 0 {
-			note = fmt.Sprintf("%d errors", e.Errors)
+			notes = append(notes, fmt.Sprintf("%d errors", e.Errors))
+		}
+		if e.NilReplies > 0 {
+			notes = append(notes, fmt.Sprintf("%d nil", e.NilReplies))
+		}
+		if e.ErrReplies > 0 {
+			notes = append(notes, fmt.Sprintf("%d refused", e.ErrReplies))
+		}
+		note := ""
+		for i, n := range notes {
+			if i > 0 {
+				note += ", "
+			}
+			note += n
 		}
 		rss := "-"
 		if e.RSSBytes > 0 {
 			rss = fmt.Sprintf("%.1f", float64(e.RSSBytes)/(1<<20))
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%.0f\t%.1f\t%.1f\t%.1f\t%.1f\t%s\t%s\n",
-			e.Target, ver, e.OpsPerSec, e.BytesPerSec/(1<<20), e.P50us, e.P99us, e.P999us, rss, note)
+		fmt.Fprintf(tw, "%s\t%s\t%.0f\t%.0f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%s\t%s\n",
+			e.Target, ver, e.OpsPerSec, e.ValueOpsPerSec, e.HitRatio*100,
+			e.BytesPerSec/(1<<20), e.P50us, e.P99us, e.P999us, rss, note)
 	}
 	tw.Flush()
 
