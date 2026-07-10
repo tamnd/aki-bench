@@ -166,6 +166,10 @@ func (s *fakeServer) reply(w *bufio.Writer, argv []string) {
 		writeBulk(w, body)
 	case "EXPIRE":
 		writeInt(w, 1)
+	case "FAILME":
+		// Always refused, so tests can exercise the server-error-reply counter
+		// without breaking the connection.
+		writeErr(w, "ERR forced failure")
 	case "LPUSH", "RPUSH", "SADD", "ZADD", "HSET":
 		// These return an integer count in real Redis; one is good enough here.
 		writeInt(w, 1)
@@ -189,6 +193,9 @@ func writeInt(w *bufio.Writer, n int64) {
 	_, _ = w.WriteString(":" + strconv.FormatInt(n, 10) + "\r\n")
 }
 func writeNull(w *bufio.Writer) { _, _ = w.WriteString("$-1\r\n") }
+func writeErr(w *bufio.Writer, s string) {
+	_, _ = w.WriteString("-" + s + "\r\n")
+}
 func writeBulk(w *bufio.Writer, s string) {
 	_, _ = w.WriteString("$" + strconv.Itoa(len(s)) + "\r\n" + s + "\r\n")
 }
