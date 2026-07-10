@@ -253,10 +253,12 @@ func run(args []string) error {
 
 	// A workload is either a flat generator (get/set/...) or a collection
 	// point-read plan (sismember/hget/zscore/zrank). A plan has a preload phase
-	// that builds the single probed collection before the measured reads.
-	gen := workload.Build(*wl, spec)
-	plan, isPlan := workload.BuildPlan(*wl, spec)
-	if gen == nil && !isPlan {
+	// that builds the single probed collection before the measured reads. The
+	// generators themselves are built per target inside entry, so each carries
+	// its own coverage tracker; the name is validated once here.
+	_, isFlat := workload.Registry()[*wl]
+	isPlan := isPlanWorkload(*wl)
+	if !isFlat && !isPlan {
 		return fmt.Errorf("unknown workload %q, choose one of %s", *wl, strings.Join(allWorkloadNames(), ", "))
 	}
 
@@ -296,12 +298,20 @@ func run(args []string) error {
 			fmt.Fprintf(os.Stderr, "flush %s: %v\n", k, err)
 			return report.Skipped(name, *wl)
 		}
+		// Each target gets its own generator carrying a fresh coverage tracker,
+		// so the distinct-key figure describes this target's window alone. The
+		// key streams stay identical across targets regardless: selectors are
+		// pure functions of (conn, seq) and the spec is the same.
+		tracker := workload.NewTracker(entries)
+		tspec := spec
+		tspec.Track = tracker
 		// For a collection plan, build the probed collection first. The preload
 		// runs on one connection so a single sequence 0..PreloadOps-1 populates
 		// every member exactly once; a multi-connection preload would restart the
 		// sequence per connection and under-populate the collection.
-		probe := gen
+		probe := workload.Build(*wl, tspec)
 		if isPlan {
+			plan, _ := workload.BuildPlan(*wl, tspec)
 			pre := load.Config{
 				Addr:        t.Addr,
 				Connections: 1,
@@ -350,6 +360,10 @@ func run(args []string) error {
 			TargetRate:  *targetRate,
 			Warmup:      warm,
 			Gen:         probe,
+			// The tracker has seen the preload and will see the warmup; reset it
+			// at the measured window's edge so the coverage row describes only
+			// the timed seconds.
+			AfterWarmup: tracker.Reset,
 		}
 		// Probe the live server's self-reported version before the load so the
 		// report records the exact build measured, not the binary name on PATH.
@@ -382,7 +396,9 @@ func run(args []string) error {
 		if memErr != nil {
 			usedMemory = 0
 		}
-		row := report.FromResult(name, *wl, res).WithVersion(version).WithMemory(t.RSSBytes(), usedMemory, entries)
+		row := report.FromResult(name, *wl, res).WithVersion(version).
+			WithMemory(t.RSSBytes(), usedMemory, entries).
+			WithKeyCoverage(tracker.Estimate(), tracker.Draws())
 		if preStatsErr == nil {
 			if postStats, perr := load.ProbeEvictionStats(t.Addr, 2*time.Second); perr == nil {
 				row = row.WithEviction(postStats.Sub(preStats))
