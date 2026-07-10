@@ -87,6 +87,7 @@ func run(args []string) error {
 		conns        = fs.Int("connections", 50, "concurrent connections")
 		pipeline     = fs.Int("pipeline", 1, "pipeline depth per connection")
 		durationStr  = fs.String("duration", "5s", "run length, for example 10s; set to 0 to use -requests")
+		warmStr      = fs.String("warm", "0s", "drive the measured connections untimed for this long before every timed window, so every target's window runs in the same thermal and power regime; 0 keeps the old cold-start behavior, gate runs should use 10s")
 		requests     = fs.Int64("requests", 0, "total requests when duration is 0")
 		valueSizeTok = fs.String("value-size", "64", "write payload size: bytes, or a band token like 1k, 64k, 1m (binary multiples, so 1k is 1024)")
 		keyCount     = fs.Int("keys", 100000, "key space size")
@@ -99,6 +100,7 @@ func run(args []string) error {
 		targetRate   = fs.Int64("rate", 0, "open-loop aggregate target ops/sec")
 		durable      = fs.Bool("durable", false, "launch servers in durable config instead of in-memory")
 		required     = fs.Float64("gate", report.DefaultRequiredSpeedup, "required speedup over Redis and Valkey")
+		genBoundEps  = fs.Float64("gen-bound-epsilon", report.DefaultGeneratorBoundEpsilon, "relative throughput spread under which a closed-loop three-way tie, together with the min-latency identity, marks the row generator-bound instead of quotable capacity")
 		jsonOut      = fs.String("json", "", "write the comparison JSON to this file")
 		smokeOnly    = fs.Bool("smoke", false, "run the compatibility smoke check instead of a load run")
 
@@ -138,6 +140,14 @@ func run(args []string) error {
 	duration, err := time.ParseDuration(*durationStr)
 	if err != nil {
 		return fmt.Errorf("bad -duration: %w", err)
+	}
+
+	warm, err := time.ParseDuration(*warmStr)
+	if err != nil {
+		return fmt.Errorf("bad -warm: %w", err)
+	}
+	if warm < 0 {
+		return fmt.Errorf("bad -warm: negative duration")
 	}
 
 	valueSize, err := workload.ParseSize(*valueSizeTok)
@@ -325,6 +335,11 @@ func run(args []string) error {
 				return report.Skipped(name, *wl)
 			}
 		}
+		// The warm drive applies to every measured window on every target, so
+		// the first target measured after an idle preload gap does not get its
+		// timed seconds on a rested CPU package while the rest run hot. The
+		// targets run in a fixed order (aki, redis, valkey below), which is
+		// exactly why an unwarmed first window is a systematic bias, not noise.
 		cfg := load.Config{
 			Addr:        t.Addr,
 			Connections: *conns,
@@ -333,6 +348,7 @@ func run(args []string) error {
 			Requests:    *requests,
 			Mode:        mode,
 			TargetRate:  *targetRate,
+			Warmup:      warm,
 			Gen:         probe,
 		}
 		// Probe the live server's self-reported version before the load so the
@@ -381,6 +397,16 @@ func run(args []string) error {
 	}
 	if *dist == "zipfian" {
 		cmp.Cell.ZipfS = *zipfS
+	}
+	// A closed-loop three-way tie that satisfies the min-latency identity is
+	// the generator's ceiling wearing three server names, so the row is
+	// stamped before it is rendered anywhere. Open-loop runs tie at the
+	// target rate on purpose and are never flagged. The harness has no
+	// per-target CPU-time sampling hook, so the identity check is the whole
+	// test here; the gate runner's /proc cputime sampling stays the
+	// cross-check for CPU-per-op.
+	if mode == load.ClosedLoop {
+		cmp.FlagGeneratorBound(*genBoundEps)
 	}
 	cmp.WriteTable(os.Stdout)
 
