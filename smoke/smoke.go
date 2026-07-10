@@ -65,6 +65,41 @@ func Run(targetName, addr string) Result {
 	return res
 }
 
+// RunStrings executes a strings-only smoke against addr. It exists for the f3
+// engine, whose server (f3srv) serves the M0 string surface only: SET, GET, the
+// INCR family, APPEND, SETRANGE/GETRANGE, DEL, EXISTS, STRLEN, TYPE, PING, and
+// ECHO. The default Run probes EXPIRE, which f3srv does not serve yet, so an f3
+// smoke needs a probe set that stays inside the served surface. The probes still
+// exercise real round-trips with checked replies, not just PING, so a server
+// that parses but mis-executes fails here rather than in a throughput number.
+func RunStrings(targetName, addr string) Result {
+	res := Result{Target: targetName}
+	cl, err := load.Dial(addr, 3*time.Second)
+	if err != nil {
+		res.Checks = append(res.Checks, Check{Name: "connect", OK: false, Detail: err.Error()})
+		return res
+	}
+	defer cl.Close()
+
+	prefix := "smoke:" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+
+	res.Checks = append(res.Checks,
+		probe(cl, "PING", [][]byte{[]byte("PING")}, isSimple("PONG")),
+		probe(cl, "ECHO", [][]byte{[]byte("ECHO"), []byte("hi")}, isBulk("hi")),
+		probe(cl, "SET", [][]byte{[]byte("SET"), []byte(prefix + "k"), []byte("v1")}, isSimple("OK")),
+		probe(cl, "GET", [][]byte{[]byte("GET"), []byte(prefix + "k")}, isBulk("v1")),
+		probe(cl, "APPEND", [][]byte{[]byte("APPEND"), []byte(prefix + "k"), []byte("v2")}, isInt(4)),
+		probe(cl, "STRLEN", [][]byte{[]byte("STRLEN"), []byte(prefix + "k")}, isInt(4)),
+		probe(cl, "GETRANGE", [][]byte{[]byte("GETRANGE"), []byte(prefix + "k"), []byte("2"), []byte("3")}, isBulk("v2")),
+		probe(cl, "INCR", [][]byte{[]byte("INCR"), []byte(prefix + "n")}, isInt(1)),
+		probe(cl, "INCR-again", [][]byte{[]byte("INCR"), []byte(prefix + "n")}, isInt(2)),
+		probe(cl, "TYPE", [][]byte{[]byte("TYPE"), []byte(prefix + "k")}, isSimple("string")),
+		probe(cl, "EXISTS", [][]byte{[]byte("EXISTS"), []byte(prefix + "k")}, isInt(1)),
+		probe(cl, "DEL", [][]byte{[]byte("DEL"), []byte(prefix + "k")}, isInt(1)),
+	)
+	return res
+}
+
 // matcher decides whether a reply value is the expected one.
 type matcher func(v any) (bool, string)
 

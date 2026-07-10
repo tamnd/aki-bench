@@ -90,3 +90,18 @@ func contains(ss []string, want string) bool {
 	}
 	return false
 }
+
+func TestLaunchArgsF3(t *testing.T) {
+	// f3srv's whole M0 flag surface is --addr, --shards, and --arena-mib, and
+	// the fairness rule runs it on shipped defaults, so the launch line must be
+	// the bare listen address: no server subcommand, no --dir, no appendonly
+	// flags, and no --aki-engine (the binary is the engine).
+	args := launchArgs(Aki, 6400, "/tmp/x", InMemory, "f3", "")
+	want := []string{"--addr", "127.0.0.1:6400"}
+	if len(args) != len(want) || args[0] != want[0] || args[1] != want[1] {
+		t.Fatalf("f3 launch args = %v, want %v", args, want)
+	}
+	if contains(args, "server") || contains(args, "--dir") || contains(args, "--appendonly") {
+		t.Fatalf("f3srv must not receive the aki binary's flag shape: %v", args)
+	}
+}

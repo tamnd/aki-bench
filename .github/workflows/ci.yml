@@ -29,6 +29,26 @@ jobs:
       - name: test
         run: go test ./...
 
+  f3-smoke:
+    name: f3srv launch smoke
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: tamnd/aki
+          path: aki-src
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      # Non-evidential by design: no rival is installed, no number gates, and the
+      # windows are seconds long. What this proves is the P13 launch target: the
+      # harness builds f3srv from the sibling tamnd/aki checkout, launches it,
+      # passes the string smoke against it, and completes a short load run.
+      - name: build f3srv, smoke, tiny load
+        run: AKI_DIR=aki-src scenarios/f3-smoke/run.sh
+
   real-bench:
     name: tiny real benchmark
     runs-on: ubuntu-latest

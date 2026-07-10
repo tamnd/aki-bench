@@ -86,6 +86,7 @@ func Registry() map[string]func(Spec) load.CommandGen {
 		"getrange": GetRange,
 		"set":      Set,
 		"incr":     Incr,
+		"append":   Append,
 		"lpush":    LPush,
 		"rpush":    RPush,
 		"sadd":     SAdd,
@@ -99,7 +100,7 @@ func Registry() map[string]func(Spec) load.CommandGen {
 
 // Names lists the standard workload names in a stable order.
 func Names() []string {
-	return []string{"get", "getrange", "set", "incr", "lpush", "rpush", "sadd", "zadd", "hset", "xadd", "mset", "mixed"}
+	return []string{"get", "getrange", "set", "incr", "append", "lpush", "rpush", "sadd", "zadd", "hset", "xadd", "mset", "mixed"}
 }
 
 // Get reads keys across the key space. It assumes the keys were populated, so a
@@ -159,6 +160,23 @@ func Incr(s Spec) load.CommandGen {
 	cmd := []byte("INCR")
 	return func(conn int, seq int64) [][]byte {
 		return [][]byte{cmd, keyAt("ctr:", sel(seq))}
+	}
+}
+
+// Append appends a fixed-size suffix to string values across the key space. It
+// is a growth workload by nature: each hit makes the value longer, which is
+// exactly what the string model's APPEND growth policy is gated on (doc 09's
+// growth multiplier per band), so values crossing a placement band mid-window is
+// the behavior under test, not an accident. Per-key growth over a window is
+// ops-per-key times ValueSize, so the key count and value size bound the final
+// value sizes the run produces.
+func Append(s Spec) load.CommandGen {
+	s = s.withDefaults()
+	sel := s.keySelector()
+	cmd := []byte("APPEND")
+	val := value(s.ValueSize)
+	return func(conn int, seq int64) [][]byte {
+		return [][]byte{cmd, keyAt("key:", sel(seq)), val}
 	}
 }
 
