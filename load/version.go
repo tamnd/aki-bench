@@ -3,6 +3,7 @@ package load
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -58,6 +59,49 @@ func ProbeServer(addr string, timeout time.Duration) (ServerInfo, error) {
 		return ServerInfo{}, fmt.Errorf("INFO server returned %T, want a bulk string", reply)
 	}
 	return parseServerInfo(body), nil
+}
+
+// ProbeUsedMemory connects to addr, asks for INFO memory, and returns the
+// server's self-reported used_memory in bytes. It is the F14 memory column's
+// apples-to-apples half: used_memory is the server's own accounting, reported
+// next to RSS so allocator slack cannot hide behind a clean number. Servers
+// that do not serve INFO (f3srv in M0) return an error, and the caller leaves
+// the column empty rather than faking it.
+func ProbeUsedMemory(addr string, timeout time.Duration) (int64, error) {
+	c, err := Dial(addr, timeout)
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+
+	if timeout > 0 {
+		_ = c.conn.SetDeadline(time.Now().Add(timeout))
+	}
+	if err := c.WriteCommand([][]byte{[]byte("INFO"), []byte("memory")}); err != nil {
+		return 0, err
+	}
+	if err := c.Flush(); err != nil {
+		return 0, err
+	}
+	reply, err := c.ReadReplyValue()
+	if err != nil {
+		return 0, err
+	}
+	body, ok := reply.([]byte)
+	if !ok {
+		return 0, fmt.Errorf("INFO memory returned %T, want a bulk string", reply)
+	}
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if v, found := bytes.CutPrefix(line, []byte("used_memory:")); found {
+			n, err := strconv.ParseInt(string(v), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("bad used_memory %q: %w", v, err)
+			}
+			return n, nil
+		}
+	}
+	return 0, fmt.Errorf("INFO memory reply has no used_memory field")
 }
 
 // parseServerInfo pulls the software name and version out of an INFO server

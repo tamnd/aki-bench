@@ -54,11 +54,13 @@ func (c Config) withDefaults() Config {
 
 // Result is the outcome of a load run.
 type Result struct {
-	Ops       int64         // successful operations
-	Errors    int64         // operations that returned a transport or protocol error
-	Elapsed   time.Duration // wall-clock duration of the run
-	Hist      *Histogram    // per-operation latency in nanoseconds
-	Connected int           // connections that came up
+	Ops          int64         // successful operations
+	Errors       int64         // operations that returned a transport or protocol error
+	Elapsed      time.Duration // wall-clock duration of the run
+	Hist         *Histogram    // per-operation latency in nanoseconds
+	Connected    int           // connections that came up
+	BytesRead    int64         // wire bytes read from the sockets (replies)
+	BytesWritten int64         // wire bytes written to the sockets (commands)
 }
 
 // OpsPerSec returns the achieved throughput.
@@ -67,6 +69,17 @@ func (r Result) OpsPerSec() float64 {
 		return 0
 	}
 	return float64(r.Ops) / r.Elapsed.Seconds()
+}
+
+// BytesPerSec returns the total wire bandwidth the run moved, both directions
+// summed. This is the CF20 column: on giant-value rows a cell where every
+// server sits at the box's copy ceiling is bandwidth-bound and its ops/s parity
+// is manufactured, so bytes/s travels with every row to make that visible.
+func (r Result) BytesPerSec() float64 {
+	if r.Elapsed <= 0 {
+		return 0
+	}
+	return float64(r.BytesRead+r.BytesWritten) / r.Elapsed.Seconds()
 }
 
 // Run executes the load described by cfg and returns the aggregated result.
@@ -133,12 +146,21 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		merged.Merge(h)
 	}
 
+	var bytesRead, bytesWritten int64
+	for _, cl := range clients {
+		r, w := cl.BytesOnWire()
+		bytesRead += r
+		bytesWritten += w
+	}
+
 	return Result{
-		Ops:       ops.Load(),
-		Errors:    errs.Load(),
-		Elapsed:   elapsed,
-		Hist:      merged,
-		Connected: len(clients),
+		Ops:          ops.Load(),
+		Errors:       errs.Load(),
+		Elapsed:      elapsed,
+		Hist:         merged,
+		Connected:    len(clients),
+		BytesRead:    bytesRead,
+		BytesWritten: bytesWritten,
 	}, nil
 }
 

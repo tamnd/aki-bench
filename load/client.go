@@ -19,9 +19,42 @@ import (
 // frame, which is all a load generator needs. It is not safe for concurrent use;
 // the load generator gives each connection its own Client.
 type Client struct {
-	conn net.Conn
+	conn *countingConn
 	r    *bufio.Reader
 	w    *bufio.Writer
+}
+
+// countingConn wraps the TCP connection and counts the bytes that actually
+// cross it in each direction. Wire bytes are the CF20 readback: on giant-value
+// rows both servers can sit at the box's copy ceiling and the ops/s ratio
+// compresses toward 1x regardless of software quality, so every row records
+// bytes/s next to ops/s and a bandwidth-bound cell is judged on p99 and RSS
+// instead of being declared a throughput tie. Counting at the conn, under the
+// bufio layers, measures what hit the socket rather than what the generator
+// intended. The counters are plain fields because a Client is single-goroutine
+// by contract and the runner reads the totals only after its workers join.
+type countingConn struct {
+	net.Conn
+	read    int64
+	written int64
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.read += int64(n)
+	return n, err
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.written += int64(n)
+	return n, err
+}
+
+// BytesOnWire returns the bytes this client has read from and written to the
+// socket so far.
+func (c *Client) BytesOnWire() (read, written int64) {
+	return c.conn.read, c.conn.written
 }
 
 // Dial connects to addr (host:port) with the given timeout and returns a ready
@@ -34,10 +67,11 @@ func Dial(addr string, timeout time.Duration) (*Client, error) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}
+	cc := &countingConn{Conn: conn}
 	return &Client{
-		conn: conn,
-		r:    bufio.NewReaderSize(conn, 64*1024),
-		w:    bufio.NewWriterSize(conn, 64*1024),
+		conn: cc,
+		r:    bufio.NewReaderSize(cc, 64*1024),
+		w:    bufio.NewWriterSize(cc, 64*1024),
 	}, nil
 }
 

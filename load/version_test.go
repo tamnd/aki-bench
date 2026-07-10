@@ -67,3 +67,35 @@ func TestServerInfoString(t *testing.T) {
 		}
 	}
 }
+
+func TestProbeUsedMemory(t *testing.T) {
+	s, err := newFakeServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	s.info = "# Memory\r\nused_memory:123456\r\nused_memory_rss:150000\r\n"
+
+	n, err := load.ProbeUsedMemory(s.addr(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 123456 {
+		t.Fatalf("used_memory = %d, want 123456", n)
+	}
+}
+
+func TestProbeUsedMemoryMissingField(t *testing.T) {
+	// A server that answers INFO without a used_memory field (or f3srv, which
+	// rejects INFO outright) must yield an error so the caller leaves the
+	// memory column empty instead of recording a fake zero footprint.
+	s, err := newFakeServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+
+	if _, err := load.ProbeUsedMemory(s.addr(), time.Second); err == nil {
+		t.Fatal("expected an error when INFO carries no used_memory")
+	}
+}
