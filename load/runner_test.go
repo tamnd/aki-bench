@@ -2,6 +2,7 @@ package load_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -234,5 +235,117 @@ func TestRunCountsWireBytes(t *testing.T) {
 	}
 	if res.BytesPerSec() <= 0 {
 		t.Fatal("expected positive wire bandwidth")
+	}
+}
+
+// TestRunSplitsNilAndErrorReplies drives a mix where every fourth operation is
+// a SET (value-bearing ack), a GET of that key (value-bearing hit), a GET of a
+// key that was never written (nil reply), and a command the server refuses
+// (server error reply). The runner must count all of them as completed ops but
+// report the nil and error replies separately, because a larger-than-memory
+// comparison gates on the ops that actually returned data.
+func TestRunSplitsNilAndErrorReplies(t *testing.T) {
+	srv, err := newFakeServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	gen := func(conn int, seq int64) [][]byte {
+		key := []byte("k:" + strconv.Itoa(conn))
+		switch seq % 4 {
+		case 0:
+			return [][]byte{[]byte("SET"), key, []byte("v")}
+		case 1:
+			return [][]byte{[]byte("GET"), key}
+		case 2:
+			return [][]byte{[]byte("GET"), []byte("never-written")}
+		default:
+			return [][]byte{[]byte("FAILME")}
+		}
+	}
+	res, err := load.Run(context.Background(), load.Config{
+		Addr:        srv.addr(),
+		Connections: 2,
+		Pipeline:    4,
+		Requests:    400,
+		Gen:         gen,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Ops != 400 {
+		t.Fatalf("ops %d, want 400: nil and error replies are still completed ops", res.Ops)
+	}
+	if res.Errors != 0 {
+		t.Fatalf("transport errors %d, want 0: a -ERR reply is not a transport failure", res.Errors)
+	}
+	if res.NilReplies != 100 {
+		t.Fatalf("nil replies %d, want 100", res.NilReplies)
+	}
+	if res.ErrReplies != 100 {
+		t.Fatalf("error replies %d, want 100", res.ErrReplies)
+	}
+	if res.ValueOps() != 200 {
+		t.Fatalf("value ops %d, want 200", res.ValueOps())
+	}
+	if got := res.HitRatio(); got != 0.5 {
+		t.Fatalf("hit ratio %v, want 0.5", got)
+	}
+	if res.ValueOpsPerSec() <= 0 || res.ValueOpsPerSec() >= res.OpsPerSec() {
+		t.Fatalf("value ops/s %v should be positive and below total ops/s %v",
+			res.ValueOpsPerSec(), res.OpsPerSec())
+	}
+}
+
+// TestReadReplyKind pins the classification: data-bearing replies, RESP nulls,
+// and server error replies each land in their own bucket, and none of them are
+// transport errors.
+func TestReadReplyKind(t *testing.T) {
+	srv, err := newFakeServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	cl, err := load.Dial(srv.addr(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+
+	roundTrip := func(argv ...string) load.ReplyKind {
+		t.Helper()
+		cmd := make([][]byte, len(argv))
+		for i, a := range argv {
+			cmd[i] = []byte(a)
+		}
+		if err := cl.WriteCommand(cmd); err != nil {
+			t.Fatal(err)
+		}
+		if err := cl.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		kind, err := cl.ReadReplyKind()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return kind
+	}
+
+	if kind := roundTrip("SET", "k", "v"); kind != load.ReplyValue {
+		t.Fatalf("+OK classified as %v, want ReplyValue", kind)
+	}
+	if kind := roundTrip("GET", "k"); kind != load.ReplyValue {
+		t.Fatalf("bulk reply classified as %v, want ReplyValue", kind)
+	}
+	if kind := roundTrip("GET", "missing"); kind != load.ReplyNil {
+		t.Fatalf("null bulk classified as %v, want ReplyNil", kind)
+	}
+	if kind := roundTrip("FAILME"); kind != load.ReplyErr {
+		t.Fatalf("-ERR classified as %v, want ReplyErr", kind)
+	}
+	if kind := roundTrip("INCR", "n"); kind != load.ReplyValue {
+		t.Fatalf("integer reply classified as %v, want ReplyValue", kind)
 	}
 }

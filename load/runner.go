@@ -65,8 +65,10 @@ func (c Config) withDefaults() Config {
 
 // Result is the outcome of a load run.
 type Result struct {
-	Ops          int64         // successful operations
+	Ops          int64         // completed operations: every reply frame received, whatever it carried
 	Errors       int64         // operations that returned a transport or protocol error
+	NilReplies   int64         // completed operations whose reply was a RESP null: answered, but no data
+	ErrReplies   int64         // completed operations whose reply was a server error (-ERR, -OOM, ...)
 	Elapsed      time.Duration // wall-clock duration of the run
 	Hist         *Histogram    // per-operation latency in nanoseconds
 	Connected    int           // connections that came up
@@ -80,6 +82,33 @@ func (r Result) OpsPerSec() float64 {
 		return 0
 	}
 	return float64(r.Ops) / r.Elapsed.Seconds()
+}
+
+// ValueOps returns the operations that returned data or a real
+// acknowledgement: completed ops minus nil replies and server error replies.
+// This is the figure a larger-than-memory comparison must gate on. An engine
+// under a memory cap with an allkeys eviction policy answers nil for every
+// evicted key at RAM speed; those answers move no data and must not count as
+// throughput against an engine that kept the data and paid the disk read.
+func (r Result) ValueOps() int64 {
+	return r.Ops - r.NilReplies - r.ErrReplies
+}
+
+// ValueOpsPerSec returns the value-bearing throughput.
+func (r Result) ValueOpsPerSec() float64 {
+	if r.Elapsed <= 0 {
+		return 0
+	}
+	return float64(r.ValueOps()) / r.Elapsed.Seconds()
+}
+
+// HitRatio returns the fraction of completed operations that were
+// value-bearing. A run with no completed operations reports 0.
+func (r Result) HitRatio() float64 {
+	if r.Ops <= 0 {
+		return 0
+	}
+	return float64(r.ValueOps()) / float64(r.Ops)
 }
 
 // BytesPerSec returns the total wire bandwidth the run moved, both directions
@@ -137,7 +166,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		defer cancel()
 	}
 
-	var ops, errs atomic.Int64
+	var cts counters
 	perConnReq := int64(0)
 	if cfg.Requests > 0 {
 		perConnReq = cfg.Requests / int64(len(clients))
@@ -157,9 +186,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		go func(conn int, cl *Client, h *Histogram) {
 			defer wg.Done()
 			if cfg.Mode == OpenLoop {
-				driveOpen(runCtx, conn, cl, h, cfg, len(clients), perConnReq, &ops, &errs)
+				driveOpen(runCtx, conn, cl, h, cfg, len(clients), perConnReq, &cts)
 			} else {
-				driveClosed(runCtx, conn, cl, h, cfg, perConnReq, &ops, &errs)
+				driveClosed(runCtx, conn, cl, h, cfg, perConnReq, &cts)
 			}
 		}(i, cl, h)
 	}
@@ -179,14 +208,37 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	return Result{
-		Ops:          ops.Load(),
-		Errors:       errs.Load(),
+		Ops:          cts.ops.Load(),
+		Errors:       cts.errs.Load(),
+		NilReplies:   cts.nils.Load(),
+		ErrReplies:   cts.errReplies.Load(),
 		Elapsed:      elapsed,
 		Hist:         merged,
 		Connected:    len(clients),
 		BytesRead:    bytesRead,
 		BytesWritten: bytesWritten,
 	}, nil
+}
+
+// counters aggregates the per-run tallies the drive loops bump. One struct
+// instead of a parameter per counter, because the reply classification added
+// two more and the drive signatures were already long.
+type counters struct {
+	ops        atomic.Int64 // completed operations
+	errs       atomic.Int64 // transport and protocol failures
+	nils       atomic.Int64 // RESP null replies
+	errReplies atomic.Int64 // server error replies
+}
+
+// record classifies one completed reply into the tallies.
+func (c *counters) record(kind ReplyKind) {
+	c.ops.Add(1)
+	switch kind {
+	case ReplyNil:
+		c.nils.Add(1)
+	case ReplyErr:
+		c.errReplies.Add(1)
+	}
 }
 
 // warm drives every client with the run's own drive loop, in the run's own
@@ -197,7 +249,7 @@ func warm(ctx context.Context, cfg Config, clients []*Client) {
 	warmCtx, cancel := context.WithTimeout(ctx, cfg.Warmup)
 	defer cancel()
 
-	var ops, errs atomic.Int64
+	var cts counters
 	var wg sync.WaitGroup
 	for i, cl := range clients {
 		wg.Add(1)
@@ -205,9 +257,9 @@ func warm(ctx context.Context, cfg Config, clients []*Client) {
 			defer wg.Done()
 			h := NewLatencyHistogram()
 			if cfg.Mode == OpenLoop {
-				driveOpen(warmCtx, conn, cl, h, cfg, len(clients), 0, &ops, &errs)
+				driveOpen(warmCtx, conn, cl, h, cfg, len(clients), 0, &cts)
 			} else {
-				driveClosed(warmCtx, conn, cl, h, cfg, 0, &ops, &errs)
+				driveClosed(warmCtx, conn, cl, h, cfg, 0, &cts)
 			}
 		}(i, cl)
 	}
@@ -217,7 +269,7 @@ func warm(ctx context.Context, cfg Config, clients []*Client) {
 // driveClosed runs one connection in closed-loop mode: send a pipeline batch,
 // read its replies, repeat. Latency is timed from first send of a batch to the
 // reply of each command in it, which keeps the pipeline's per-op timing honest.
-func driveClosed(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Config, perConnReq int64, ops, errs *atomic.Int64) {
+func driveClosed(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Config, perConnReq int64, cts *counters) {
 	var seq int64
 	var issued int64
 	for {
@@ -234,24 +286,24 @@ func driveClosed(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Co
 			argv := cfg.Gen(conn, seq)
 			seq++
 			if err := cl.WriteCommand(argv); err != nil {
-				errs.Add(1)
+				cts.errs.Add(1)
 				return
 			}
 			sendTimes[i] = time.Now()
 		}
 		if err := cl.Flush(); err != nil {
-			errs.Add(1)
+			cts.errs.Add(1)
 			return
 		}
 		for i := 0; i < batch; i++ {
-			err := cl.ReadReply()
+			kind, err := cl.ReadReplyKind()
 			now := time.Now()
 			if err != nil {
-				errs.Add(1)
+				cts.errs.Add(1)
 				return
 			}
 			h.RecordValue(now.Sub(sendTimes[i]).Nanoseconds())
-			ops.Add(1)
+			cts.record(kind)
 			issued++
 		}
 	}
@@ -262,7 +314,7 @@ func driveClosed(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Co
 // Latency is measured against the intended send time, not the actual one, so a
 // late issue still counts its queueing delay. The histogram records the corrected
 // value so a stall backfills the requests it swallowed.
-func driveOpen(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Config, nConns int, perConnReq int64, ops, errs *atomic.Int64) {
+func driveOpen(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Config, nConns int, perConnReq int64, cts *counters) {
 	rate := cfg.TargetRate
 	if rate <= 0 {
 		rate = int64(nConns) // degenerate but keeps the loop alive
@@ -299,20 +351,21 @@ func driveOpen(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Conf
 		argv := cfg.Gen(conn, seq)
 		seq++
 		if err := cl.WriteCommand(argv); err != nil {
-			errs.Add(1)
+			cts.errs.Add(1)
 			return
 		}
 		if err := cl.Flush(); err != nil {
-			errs.Add(1)
+			cts.errs.Add(1)
 			return
 		}
-		if err := cl.ReadReply(); err != nil {
-			errs.Add(1)
+		kind, err := cl.ReadReplyKind()
+		if err != nil {
+			cts.errs.Add(1)
 			return
 		}
 		latency := time.Since(intended).Nanoseconds()
 		h.RecordCorrectedValue(latency, expected)
-		ops.Add(1)
+		cts.record(kind)
 		issued++
 	}
 }

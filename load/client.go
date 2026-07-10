@@ -109,6 +109,45 @@ func (c *Client) ReadReply() error {
 	return err
 }
 
+// ReplyKind classifies one reply frame for the runner's counters. The split
+// exists because "the server answered" and "the server returned the data" are
+// different events, and a benchmark that counts them the same lets an engine
+// that evicted half its keyspace outscore one that kept it: the eviction
+// victim answers nil at RAM speed while the retaining engine pays the disk
+// read. The f3 M0 LTM cell measured exactly that (tamnd/aki#542).
+type ReplyKind int
+
+const (
+	// ReplyValue is a reply that carries data or a real acknowledgement: a
+	// bulk string, simple string, integer, double, bool, or aggregate.
+	ReplyValue ReplyKind = iota
+	// ReplyNil is a RESP null: the server answered, but with no data. On a
+	// read workload over a populated keyspace this is a miss.
+	ReplyNil
+	// ReplyErr is a server error reply (-ERR ..., -OOM ...): the command was
+	// refused. A SET that bounces off maxmemory under noeviction is not a
+	// completed write.
+	ReplyErr
+)
+
+// ReadReplyKind reads exactly one reply frame, discards the contents, and
+// returns its classification. Transport and protocol failures come back as the
+// error, exactly like ReadReply; a server error reply is a ReplyErr result,
+// not an error, because the connection is still healthy.
+func (c *Client) ReadReplyKind() (ReplyKind, error) {
+	v, err := c.ReadReplyValue()
+	if err != nil {
+		return ReplyValue, err
+	}
+	switch v.(type) {
+	case nil:
+		return ReplyNil, nil
+	case replyError:
+		return ReplyErr, nil
+	}
+	return ReplyValue, nil
+}
+
 // ReadReplyValue reads one reply frame and returns it as a decoded value. It
 // understands the RESP2 and the common RESP3 type bytes so a target running in
 // either mode parses cleanly. The smoke check uses it to compare replies; the
