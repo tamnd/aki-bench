@@ -58,7 +58,10 @@ type Spec struct {
 	// binary, which accepts the same `server --addr ...` flag shape as the aki
 	// binary so the launch path is identical. The legacy engines (btree, hybrid,
 	// hot) are slower and served by the aki binary; the caller picks the matching
-	// binary so a baseline never silently measures the wrong path.
+	// binary so a baseline never silently measures the wrong path. The f3 engine
+	// is the spec 2064/f3 rewrite, served by the f3srv binary; f3srv takes a bare
+	// --addr with no subcommand and no persistence flags (it is in-memory only in
+	// M0), so its launch line is its own case below.
 	AkiEngine string
 	AkiNet    string
 
@@ -237,6 +240,14 @@ func launchArgs(k Kind, port int, dataDir string, d Durability, akiEngine, akiNe
 	p := strconv.Itoa(port)
 	switch k {
 	case Aki:
+		// f3srv is the spec 2064/f3 rewrite's binary. It has no server subcommand
+		// and no persistence flags yet: the whole flag surface in M0 is --addr,
+		// --shards, and --arena-mib. It runs with its shipped defaults per the
+		// fairness rule (doc 18 section 6.4: the product runs what a user gets),
+		// and the data dir is only its working directory, set by the launcher.
+		if akiEngine == "f3" {
+			return []string{"--addr", "127.0.0.1:" + p}
+		}
 		// aki's server subcommand takes a listen address and a working directory,
 		// and it speaks the same appendonly and appendfsync flags as Redis. Mapping
 		// durability through those flags keeps the fairness config identical across

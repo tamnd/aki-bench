@@ -91,6 +91,54 @@ func (s *tinyServer) handle(conn net.Conn) {
 			w.WriteString(":" + strconv.FormatInt(n, 10) + "\r\n")
 		case "EXPIRE":
 			w.WriteString(":1\r\n")
+		case "ECHO":
+			w.WriteString("$" + strconv.Itoa(len(argv[1])) + "\r\n" + argv[1] + "\r\n")
+		case "APPEND":
+			s.mu.Lock()
+			v := s.data[argv[1]] + argv[2]
+			s.data[argv[1]] = v
+			s.mu.Unlock()
+			w.WriteString(":" + strconv.Itoa(len(v)) + "\r\n")
+		case "STRLEN":
+			s.mu.Lock()
+			v := s.data[argv[1]]
+			s.mu.Unlock()
+			w.WriteString(":" + strconv.Itoa(len(v)) + "\r\n")
+		case "GETRANGE":
+			s.mu.Lock()
+			v := s.data[argv[1]]
+			s.mu.Unlock()
+			start, _ := strconv.Atoi(argv[2])
+			end, _ := strconv.Atoi(argv[3])
+			if end >= len(v) {
+				end = len(v) - 1
+			}
+			seg := ""
+			if start <= end && start < len(v) {
+				seg = v[start : end+1]
+			}
+			w.WriteString("$" + strconv.Itoa(len(seg)) + "\r\n" + seg + "\r\n")
+		case "TYPE":
+			w.WriteString("+string\r\n")
+		case "EXISTS":
+			s.mu.Lock()
+			_, ok := s.data[argv[1]]
+			s.mu.Unlock()
+			n := 0
+			if ok {
+				n = 1
+			}
+			w.WriteString(":" + strconv.Itoa(n) + "\r\n")
+		case "DEL":
+			s.mu.Lock()
+			_, ok := s.data[argv[1]]
+			delete(s.data, argv[1])
+			s.mu.Unlock()
+			n := 0
+			if ok {
+				n = 1
+			}
+			w.WriteString(":" + strconv.Itoa(n) + "\r\n")
 		default:
 			w.WriteString("+OK\r\n")
 		}
@@ -164,6 +212,50 @@ func TestSmokePasses(t *testing.T) {
 			}
 		}
 		t.Fatal("expected all smoke checks to pass")
+	}
+}
+
+func TestStringsSmokePasses(t *testing.T) {
+	srv, err := newTinyServer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	res := smoke.RunStrings("fake", srv.addr())
+	if !res.Pass() {
+		for _, c := range res.Checks {
+			if !c.OK {
+				t.Errorf("check %s failed: %s", c.Name, c.Detail)
+			}
+		}
+		t.Fatal("expected all strings smoke checks to pass")
+	}
+}
+
+func TestStringsSmokeStaysInsideTheF3Surface(t *testing.T) {
+	// The strings smoke exists because f3srv serves only the M0 string surface;
+	// a probe outside that surface (EXPIRE, MGET) would fail against a correct
+	// f3srv and make the smoke useless as a launch check. Pin the probe set to
+	// the served verbs so a future probe addition trips this before it trips CI.
+	served := map[string]bool{
+		"PING": true, "ECHO": true, "SET": true, "GET": true, "APPEND": true,
+		"STRLEN": true, "GETRANGE": true, "SETRANGE": true, "TYPE": true,
+		"EXISTS": true, "DEL": true, "INCR": true, "DECR": true, "INCRBY": true,
+		"DECRBY": true, "INCRBYFLOAT": true,
+	}
+	srv, err := newTinyServer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	res := smoke.RunStrings("fake", srv.addr())
+	for _, c := range res.Checks {
+		verb := strings.SplitN(c.Name, "-", 2)[0]
+		if !served[verb] {
+			t.Errorf("probe %s is outside the f3srv M0 string surface", c.Name)
+		}
 	}
 }
 

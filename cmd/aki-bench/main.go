@@ -106,9 +106,10 @@ func run(args []string) error {
 		valkeyAddr = fs.String("valkey-addr", "", "connect to a running valkey at host:port instead of launching")
 		akiBin     = fs.String("aki-bin", "aki", "aki binary for launch mode with a legacy engine (btree, hybrid, hot)")
 		f1srvBin   = fs.String("f1srv-bin", "f1srv", "f1srv binary for launch mode with the f1raw engine (the default)")
+		f3srvBin   = fs.String("f3srv-bin", "f3srv", "f3srv binary for launch mode with the f3 engine (the spec 2064/f3 rewrite)")
 		redisBin   = fs.String("redis-bin", "redis-server", "redis binary for launch mode")
 		valkeyBin  = fs.String("valkey-bin", "valkey-server", "valkey binary for launch mode")
-		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product) or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
+		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product), f3 (the spec 2064/f3 rewrite served by f3srv; strings only in M0, becomes the product at the M0 gate run), or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
 		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
 
 		cpuSplit  = fs.Bool("cpu-split", true, "partition cores so the launched server and the load generator never share a core (Linux launch mode, on by default); removes the co-located-client starvation that understates the ratio; pass -cpu-split=false to co-locate")
@@ -143,24 +144,28 @@ func run(args []string) error {
 		dur = target.Durable
 	}
 
-	// f1raw, hot, and hybrid are in-memory only in this slice, so a durable
+	// f1raw, f3, hot, and hybrid are in-memory only in this slice, so a durable
 	// comparison on them would pit a non-durable aki against fsync-per-write Redis
 	// and Valkey, which is not a fair durable-vs-durable number. In durable mode
 	// fall back to the durable B-tree and say so, rather than quietly reporting an
 	// unfair win.
 	engine := *akiEngine
-	if dur == target.Durable && (engine == "f1raw" || engine == "hot" || engine == "hybrid") {
+	if dur == target.Durable && (engine == "f1raw" || engine == "f3" || engine == "hot" || engine == "hybrid") {
 		fmt.Fprintf(os.Stderr, "durable mode: %s engine is in-memory only, using btree for a fair durable comparison\n", engine)
 		engine = "btree"
 	}
 
 	// f1raw is the default fast engine and it is served by its own binary, f1srv,
-	// not the aki binary. The legacy engines (btree, hybrid, hot) are served by the
-	// aki binary through its --aki-engine flag. Pick the binary that matches the
-	// engine so launch mode never points the wrong server at the engine name.
+	// not the aki binary. The f3 rewrite is likewise served by its own binary,
+	// f3srv. The legacy engines (btree, hybrid, hot) are served by the aki binary
+	// through its --aki-engine flag. Pick the binary that matches the engine so
+	// launch mode never points the wrong server at the engine name.
 	akiServerBin := *akiBin
-	if engine == "f1raw" {
+	switch engine {
+	case "f1raw":
 		akiServerBin = *f1srvBin
+	case "f3":
+		akiServerBin = *f3srvBin
 	}
 
 	// Pin the launched server and this load generator to disjoint cores when
@@ -195,7 +200,10 @@ func run(args []string) error {
 	}
 
 	if *smokeOnly {
-		return runSmoke(targets)
+		// f3srv serves the M0 string surface only, so the smoke sticks to string
+		// probes. The same reduced set runs against every present target so all
+		// three are checked on identical round-trips.
+		return runSmoke(targets, engine == "f3")
 	}
 
 	spec := workload.Spec{
@@ -350,7 +358,10 @@ const cpuServerEnv = "AKIBENCH_CPU_SERVER"
 // starts from the same empty state whether the server was just launched or is a
 // persistent reference carrying a prior run's keys. It opens one short-lived
 // connection, sends the command, and waits for the reply so the flush is complete
-// before preload begins.
+// before preload begins. A server-side error reply is tolerated by ReadReply's
+// contract (an error reply is a value, not a transport failure), which is the
+// right call for f3srv: it does not serve FLUSHALL yet, and in launch mode it
+// starts empty, so the flush it rejects is a no-op anyway.
 func flushTarget(addr string) error {
 	cl, err := load.Dial(addr, 5*time.Second)
 	if err != nil {
@@ -403,7 +414,7 @@ func allWorkloadNames() []string {
 	return append(append([]string{}, workload.Names()...), workload.PlanNames()...)
 }
 
-func runSmoke(targets map[target.Kind]*target.Target) error {
+func runSmoke(targets map[target.Kind]*target.Target, stringsOnly bool) error {
 	names := map[target.Kind]string{target.Aki: "aki", target.Redis: "redis", target.Valkey: "valkey"}
 	allPass := true
 	for _, k := range []target.Kind{target.Aki, target.Redis, target.Valkey} {
@@ -411,7 +422,12 @@ func runSmoke(targets map[target.Kind]*target.Target) error {
 		if !ok {
 			continue
 		}
-		res := smoke.Run(names[k], t.Addr)
+		var res smoke.Result
+		if stringsOnly {
+			res = smoke.RunStrings(names[k], t.Addr)
+		} else {
+			res = smoke.Run(names[k], t.Addr)
+		}
 		status := "PASS"
 		if !res.Pass() {
 			status = "FAIL"
