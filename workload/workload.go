@@ -66,15 +66,45 @@ func (s Spec) memberSelector() Selector {
 	return tracked(uniformSelector(int64(s.Members)), s.Track)
 }
 
+// StringKeyPrefix is the prefix every flat string workload (get, set, mixed,
+// getrange) puts in front of the key-space index, so key i is "key:i". The
+// post-run retrievability probe needs the exact same format to reconstruct the
+// keys it samples, so the prefix lives here rather than as a literal scattered
+// across the generators.
+const StringKeyPrefix = "key:"
+
+// StringFillByte is the single byte every flat string workload repeats to build
+// its value payload. The retrievability probe checks a fetched value is exactly
+// ValueSize bytes of this byte, which is a cheap content checksum: a truncated
+// or garbled value fails it. Keep value and the probe reading the same constant.
+const StringFillByte = 'x'
+
+// StringValue builds the exact payload a flat string workload writes for a given
+// value size: ValueSize bytes of StringFillByte. The retrievability probe uses
+// it as the expected content so the workload and the probe never drift.
+func StringValue(size int) []byte {
+	if size < 0 {
+		size = 0
+	}
+	v := make([]byte, size)
+	for i := range v {
+		v[i] = StringFillByte
+	}
+	return v
+}
+
 // value builds a deterministic payload of the configured size. The content does
 // not matter to the server, only the length, so a repeated byte keeps allocation
 // cheap and reproducible.
 func value(size int) []byte {
-	v := make([]byte, size)
-	for i := range v {
-		v[i] = 'x'
-	}
-	return v
+	return StringValue(size)
+}
+
+// StringKeyAt formats the flat string key for a key-space index, "key:i". It is
+// the exported form of keyAt bound to StringKeyPrefix, so the retrievability
+// probe builds the same key bytes the generators do.
+func StringKeyAt(idx int64) []byte {
+	return keyAt(StringKeyPrefix, idx)
 }
 
 // keyAt returns the key for a given key-space index. The index is produced by a
