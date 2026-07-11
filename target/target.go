@@ -209,6 +209,19 @@ func (t *Target) RSSBytes() int64 {
 	return rssBytes(t.cmd.Process.Pid)
 }
 
+// PeakRSSBytes returns the launched server's peak resident set size in bytes
+// (VmHWM), or 0 when it cannot be measured for the same reasons RSSBytes cannot:
+// connect mode has no PID, and off Linux there is no /proc. Peak travels next to
+// steady RSS because the LTM pitch is a memory-ceiling claim, and a peak that
+// spikes above a rival during load breaks that claim even when the settled RSS
+// is lower.
+func (t *Target) PeakRSSBytes() int64 {
+	if t.cmd == nil || t.cmd.Process == nil {
+		return 0
+	}
+	return hwmBytes(t.cmd.Process.Pid)
+}
+
 // Close stops a launched server and removes its data directory. It is a no-op
 // for a connect-mode target. The Wait after Kill is bounded by a timeout so a
 // process wedged in uninterruptible I/O cannot hang the harness: across a
