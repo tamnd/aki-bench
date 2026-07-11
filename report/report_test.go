@@ -478,3 +478,72 @@ func TestJSONCarriesDistinctKeys(t *testing.T) {
 		t.Fatalf("untracked entries must omit distinct_keys_est:\n%s", out)
 	}
 }
+
+func TestWithCoverageAndPeakMemory(t *testing.T) {
+	// A half-evicted run: 1000 of 2000 sampled keys came back retrievable, so the
+	// fraction is 0.5 and the coverage columns carry the split.
+	res := load.RetrievabilityResult{Sampled: 2000, Retrievable: 1000, Missing: 1000}
+	e := entry("redis", 100000, 50).WithCoverage(res, 1_000_000)
+	if e.CoverageSampled != 2000 || e.CoverageRetrievable != 1000 || e.CoverageMissing != 1000 {
+		t.Fatalf("coverage split lost: %+v", e)
+	}
+	if e.CoverageFraction != 0.5 || e.CoverageKeyspace != 1_000_000 {
+		t.Fatalf("coverage fraction/keyspace = %v/%d, want 0.5/1000000", e.CoverageFraction, e.CoverageKeyspace)
+	}
+
+	// Peak memory over the retrievable half: 512 MiB over 500k retrievable keys is
+	// ~1074 bytes per retrievable key, twice the naive bytes-per-key a
+	// half-evicted server would post against the full keyspace.
+	peak := int64(512) << 20
+	e = e.WithPeakMemory(peak)
+	if e.PeakRSSBytes != peak {
+		t.Fatalf("peak_rss_bytes lost: %d", e.PeakRSSBytes)
+	}
+	want := float64(peak) / (0.5 * 1_000_000)
+	if e.BytesPerRetrievableKey != want {
+		t.Fatalf("bytes_per_retrievable_key = %.2f, want %.2f", e.BytesPerRetrievableKey, want)
+	}
+}
+
+func TestWithCoverageSkippedProbeStaysEmpty(t *testing.T) {
+	// A zero-sample probe (coverage off) must leave every coverage column empty,
+	// and a peak with no coverage must not invent a bytes-per-retrievable-key.
+	e := entry("aki", 100000, 50).WithCoverage(load.RetrievabilityResult{}, 1_000_000)
+	if e.CoverageSampled != 0 || e.CoverageFraction != 0 || e.CoverageKeyspace != 0 {
+		t.Fatalf("skipped probe populated coverage: %+v", e)
+	}
+	e = e.WithPeakMemory(int64(256) << 20)
+	if e.BytesPerRetrievableKey != 0 {
+		t.Fatalf("bytes_per_retrievable_key must stay empty without coverage, got %.2f", e.BytesPerRetrievableKey)
+	}
+}
+
+func TestTableRendersCoverageAndPeak(t *testing.T) {
+	aki := entry("aki", 200000, 50).
+		WithCoverage(load.RetrievabilityResult{Sampled: 1000, Retrievable: 1000}, 1_000_000).
+		WithPeakMemory(int64(128) << 20)
+	redis := entry("redis", 100000, 60).
+		WithCoverage(load.RetrievabilityResult{Sampled: 1000, Retrievable: 500, Missing: 500}, 1_000_000).
+		WithPeakMemory(int64(512) << 20)
+	valkey := entry("valkey", 95000, 55)
+	cmp := NewComparison("get", aki, redis, valkey, DefaultRequiredSpeedup)
+
+	var buf bytes.Buffer
+	cmp.WriteTable(&buf)
+	out := buf.String()
+	if !strings.Contains(out, "cov%") || !strings.Contains(out, "hwm MB") {
+		t.Fatalf("table missing coverage/peak columns:\n%s", out)
+	}
+	// The half-evicted rival must show its 50% coverage in the callout.
+	if !strings.Contains(out, "redis") || !strings.Contains(out, "retrievable") {
+		t.Fatalf("table missing coverage callout:\n%s", out)
+	}
+
+	var jbuf bytes.Buffer
+	if err := cmp.WriteJSON(&jbuf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jbuf.String(), "coverage_fraction") || !strings.Contains(jbuf.String(), "peak_rss_bytes") {
+		t.Fatalf("json missing coverage/peak fields:\n%s", jbuf.String())
+	}
+}
