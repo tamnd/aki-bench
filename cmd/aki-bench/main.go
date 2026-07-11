@@ -83,26 +83,27 @@ func main() {
 func run(args []string) error {
 	fs := flag.NewFlagSet("aki-bench", flag.ContinueOnError)
 	var (
-		wl           = fs.String("workload", "set", "workload name: "+strings.Join(allWorkloadNames(), ", "))
-		conns        = fs.Int("connections", 50, "concurrent connections")
-		pipeline     = fs.Int("pipeline", 1, "pipeline depth per connection")
-		durationStr  = fs.String("duration", "5s", "run length, for example 10s; set to 0 to use -requests")
-		warmStr      = fs.String("warm", "0s", "drive the measured connections untimed for this long before every timed window, so every target's window runs in the same thermal and power regime; 0 keeps the old cold-start behavior, gate runs should use 10s")
-		requests     = fs.Int64("requests", 0, "total requests when duration is 0")
-		valueSizeTok = fs.String("value-size", "64", "write payload size: bytes, or a band token like 1k, 64k, 1m (binary multiples, so 1k is 1024)")
-		keyCount     = fs.Int("keys", 100000, "key space size")
-		members      = fs.Int("members", 0, "member space for collection point-read workloads; defaults to -keys")
-		card         = fs.String("card", "", "cardinality band preset from the doc 18 gate matrix: 1, 10, 10k, or 1M (any count token works); sets -members for a collection workload and -keys for a flat one, and is recorded in the result row as the band the cell ran at")
-		dist         = fs.String("dist", "uniform", "access pattern over the space: uniform or zipfian")
-		zipfS        = fs.Float64("zipf-s", 0.99, "zipfian skew exponent when -dist is zipfian")
-		readRatio    = fs.Int("read-ratio", 80, "read percent for the mixed workload")
-		openLoop     = fs.Bool("open-loop", false, "open-loop mode with coordinated-omission correction")
-		targetRate   = fs.Int64("rate", 0, "open-loop aggregate target ops/sec")
-		durable      = fs.Bool("durable", false, "launch servers in durable config instead of in-memory")
-		required     = fs.Float64("gate", report.DefaultRequiredSpeedup, "required speedup over Redis and Valkey")
-		genBoundEps  = fs.Float64("gen-bound-epsilon", report.DefaultGeneratorBoundEpsilon, "relative throughput spread under which a closed-loop three-way tie, together with the min-latency identity, marks the row generator-bound instead of quotable capacity")
-		jsonOut      = fs.String("json", "", "write the comparison JSON to this file")
-		smokeOnly    = fs.Bool("smoke", false, "run the compatibility smoke check instead of a load run")
+		wl             = fs.String("workload", "set", "workload name: "+strings.Join(allWorkloadNames(), ", "))
+		conns          = fs.Int("connections", 50, "concurrent connections")
+		pipeline       = fs.Int("pipeline", 1, "pipeline depth per connection")
+		durationStr    = fs.String("duration", "5s", "run length, for example 10s; set to 0 to use -requests")
+		warmStr        = fs.String("warm", "0s", "drive the measured connections untimed for this long before every timed window, so every target's window runs in the same thermal and power regime; 0 keeps the old cold-start behavior, gate runs should use 10s")
+		requests       = fs.Int64("requests", 0, "total requests when duration is 0")
+		valueSizeTok   = fs.String("value-size", "64", "write payload size: bytes, or a band token like 1k, 64k, 1m (binary multiples, so 1k is 1024)")
+		keyCount       = fs.Int("keys", 100000, "key space size")
+		members        = fs.Int("members", 0, "member space for collection point-read workloads; defaults to -keys")
+		card           = fs.String("card", "", "cardinality band preset from the doc 18 gate matrix: 1, 10, 10k, or 1M (any count token works); sets -members for a collection workload and -keys for a flat one, and is recorded in the result row as the band the cell ran at")
+		dist           = fs.String("dist", "uniform", "access pattern over the space: uniform or zipfian")
+		zipfS          = fs.Float64("zipf-s", 0.99, "zipfian skew exponent when -dist is zipfian")
+		readRatio      = fs.Int("read-ratio", 80, "read percent for the mixed workload")
+		openLoop       = fs.Bool("open-loop", false, "open-loop mode with coordinated-omission correction")
+		targetRate     = fs.Int64("rate", 0, "open-loop aggregate target ops/sec")
+		durable        = fs.Bool("durable", false, "launch servers in durable config instead of in-memory")
+		required       = fs.Float64("gate", report.DefaultRequiredSpeedup, "required speedup over Redis and Valkey")
+		genBoundEps    = fs.Float64("gen-bound-epsilon", report.DefaultGeneratorBoundEpsilon, "relative throughput spread under which a closed-loop three-way tie, together with the min-latency identity, marks the row generator-bound instead of quotable capacity")
+		jsonOut        = fs.String("json", "", "write the comparison JSON to this file")
+		smokeOnly      = fs.Bool("smoke", false, "run the compatibility smoke check instead of a load run")
+		coverageSample = fs.Int("coverage-probe", 0, "after the measured window, sample this many random keys across the full keyspace and report the fraction retrievable with the correct length and content; 0 skips it. Only meaningful for a flat string workload (get, set, mixed, getrange). This is the larger-than-memory dataset-coverage check: a rival capped at maxmemory answers nil here for every key it evicted, so a high-ops run that silently dropped half its data shows a coverage well under 100%")
 
 		akiAddr    = fs.String("aki-addr", "", "connect to a running aki at host:port instead of launching")
 		redisAddr  = fs.String("redis-addr", "", "connect to a running redis at host:port instead of launching")
@@ -399,6 +400,35 @@ func run(args []string) error {
 		row := report.FromResult(name, *wl, res).WithVersion(version).
 			WithMemory(t.RSSBytes(), usedMemory, entries).
 			WithKeyCoverage(tracker.Estimate(), tracker.Draws())
+		// The post-run dataset-coverage probe: sample random keys across the full
+		// keyspace and report how many are still retrievable with the exact length
+		// and content the workload wrote. This is the LTM fairness check the M0
+		// gate lacked. It only makes sense for a flat string workload that leaves
+		// key:i holding ValueSize fill bytes (get, set, mixed, getrange); for a
+		// collection or counter workload the probe has no such invariant to check
+		// and is skipped. In connect mode it still runs, so a box-launched rival
+		// under a maxmemory cap reports its evicted keys here as misses.
+		if *coverageSample > 0 && coverableWorkload(*wl) {
+			cov, cerr := load.ProbeRetrievability(load.RetrievabilitySpec{
+				Addr:      t.Addr,
+				KeyPrefix: workload.StringKeyPrefix,
+				KeyCount:  spec.KeyCount,
+				ValueSize: valueSize,
+				Fill:      workload.StringFillByte,
+				Sample:    *coverageSample,
+				Seed:      1,
+				Timeout:   30 * time.Second,
+			})
+			if cerr != nil {
+				fmt.Fprintf(os.Stderr, "coverage probe %s: %v\n", k, cerr)
+			} else {
+				row = row.WithCoverage(cov, spec.KeyCount)
+			}
+		}
+		// Peak resident set (VmHWM) after the coverage fields are set, so the
+		// derived bytes-per-retrievable-key can see the fraction. Empty in connect
+		// mode and off Linux, where the box runner reads /proc for the peak.
+		row = row.WithPeakMemory(t.PeakRSSBytes())
 		if preStatsErr == nil {
 			if postStats, perr := load.ProbeEvictionStats(t.Addr, 2*time.Second); perr == nil {
 				row = row.WithEviction(postStats.Sub(preStats))
@@ -528,6 +558,21 @@ func applyCPUSplit(enabled bool, serverList, clientList string, launching bool) 
 // collection point-read plans.
 func allWorkloadNames() []string {
 	return append(append([]string{}, workload.Names()...), workload.PlanNames()...)
+}
+
+// coverableWorkload reports whether the retrievability probe can check name's
+// keyspace. The probe reads key:i and expects exactly ValueSize fill bytes, so
+// it only applies to the flat string workloads that leave the keyspace in that
+// shape: set and getrange write it, get and mixed preload it. incr stores a
+// counter, append grows the value past ValueSize, and the collection plans hold
+// members not string values, so none of them satisfy the probe's invariant.
+func coverableWorkload(name string) bool {
+	switch name {
+	case "get", "set", "mixed", "getrange":
+		return true
+	default:
+		return false
+	}
 }
 
 // isPlanWorkload reports whether name is a collection point-read plan, which is
