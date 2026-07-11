@@ -71,6 +71,36 @@ type Entry struct {
 	UsedMemory  int64   `json:"used_memory,omitempty"`
 	BytesPerKey float64 `json:"bytes_per_key,omitempty"`
 
+	// PeakRSSBytes is the server process's peak resident set size (VmHWM) over
+	// the run. Peak travels next to steady RSS because the LTM claim is a
+	// memory-ceiling claim: a peak that spikes above a rival during load defeats
+	// aki's less-memory pitch even when the settled RSS is lower. Zero means not
+	// measured (connect mode, non-Linux).
+	PeakRSSBytes int64 `json:"peak_rss_bytes,omitempty"`
+
+	// The post-run retrievability probe: of CoverageSampled random keys drawn
+	// across the full keyspace, how many came back with the exact length and
+	// content the workload wrote (CoverageRetrievable) versus were dropped
+	// (CoverageMissing). CoverageFraction is retrievable over sampled, the
+	// dataset-coverage figure the LTM equal-cap arm compares side by side: a
+	// capped rival that evicted half the keyspace reports about 0.5 here while
+	// aki, which kept the data, reports 1.0. Zero sampled means the probe did
+	// not run. CoverageKeyspace records the space the sample was drawn from so
+	// the per-retrievable-key cost can scale the fraction up to the whole set.
+	CoverageSampled     int     `json:"coverage_sampled,omitempty"`
+	CoverageRetrievable int     `json:"coverage_retrievable,omitempty"`
+	CoverageMissing     int     `json:"coverage_missing,omitempty"`
+	CoverageFraction    float64 `json:"coverage_fraction,omitempty"`
+	CoverageKeyspace    int     `json:"coverage_keyspace,omitempty"`
+
+	// BytesPerRetrievableKey is peak memory over the keys the server can still
+	// serve (CoverageFraction times the full keyspace). It is the honest LTM
+	// cost metric: a rival that dropped half its dataset to stay under a cap
+	// pays its peak bytes over half the keys, so its per-retrievable-key cost is
+	// double what a bytes-per-key over the nominal keyspace would show. Zero
+	// when peak or coverage is unknown.
+	BytesPerRetrievableKey float64 `json:"bytes_per_retrievable_key,omitempty"`
+
 	// DistinctKeysEst is how many distinct key-space indices the measured
 	// window actually selected (exact under a bitmap, a HyperLogLog estimate
 	// on giant spaces), and KeyDraws is how many selector draws produced
@@ -150,6 +180,42 @@ func (e Entry) WithMemory(rss, usedMemory int64, keyspace int) Entry {
 	e.UsedMemory = usedMemory
 	if usedMemory > 0 && keyspace > 0 {
 		e.BytesPerKey = float64(usedMemory) / float64(keyspace)
+	}
+	return e
+}
+
+// WithCoverage returns the entry carrying the post-run retrievability probe over
+// a keyspace of keyCount keys: the sample split and the retrievable fraction.
+// BytesPerRetrievableKey is left for WithPeakMemory, the call that knows the
+// peak footprint; call WithCoverage first so that derivation can see the
+// fraction. A zero-sample result (probe skipped) leaves every coverage column
+// out of the JSON.
+func (e Entry) WithCoverage(res load.RetrievabilityResult, keyCount int) Entry {
+	if res.Sampled <= 0 {
+		return e
+	}
+	e.CoverageSampled = res.Sampled
+	e.CoverageRetrievable = res.Retrievable
+	e.CoverageMissing = res.Missing
+	e.CoverageFraction = res.Fraction()
+	e.CoverageKeyspace = keyCount
+	return e
+}
+
+// WithPeakMemory returns the entry carrying the peak resident set (VmHWM) and,
+// when a coverage probe already set the retrievable fraction, the derived
+// bytes-per-retrievable-key. Call it after WithCoverage. A zero peak leaves both
+// the peak and the derived column out.
+func (e Entry) WithPeakMemory(peak int64) Entry {
+	if peak <= 0 {
+		return e
+	}
+	e.PeakRSSBytes = peak
+	if e.CoverageFraction > 0 && e.CoverageKeyspace > 0 {
+		retrievable := e.CoverageFraction * float64(e.CoverageKeyspace)
+		if retrievable > 0 {
+			e.BytesPerRetrievableKey = float64(peak) / retrievable
+		}
 	}
 	return e
 }
@@ -423,14 +489,14 @@ func (c Comparison) WriteTable(w io.Writer) {
 			c.Cell.Dist, zipfNote, c.Cell.Pipeline, c.Cell.Connections)
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "target\tversion\tops/sec\tvops/sec\thit%\tMB/s\tp50 us\tp99 us\tp999 us\trss MB\tnote")
+	fmt.Fprintln(tw, "target\tversion\tops/sec\tvops/sec\thit%\tcov%\tMB/s\tp50 us\tp99 us\tp999 us\trss MB\thwm MB\tnote")
 	for _, e := range []Entry{c.Aki, c.Redis, c.Valkey} {
 		ver := e.Version
 		if ver == "" {
 			ver = "-"
 		}
 		if e.Skipped {
-			fmt.Fprintf(tw, "%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\tskipped\n", e.Target, ver)
+			fmt.Fprintf(tw, "%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\tskipped\n", e.Target, ver)
 			continue
 		}
 		var notes []string
@@ -454,9 +520,17 @@ func (c Comparison) WriteTable(w io.Writer) {
 		if e.RSSBytes > 0 {
 			rss = fmt.Sprintf("%.1f", float64(e.RSSBytes)/(1<<20))
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%.0f\t%.0f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%s\t%s\n",
-			e.Target, ver, e.OpsPerSec, e.ValueOpsPerSec, e.HitRatio*100,
-			e.BytesPerSec/(1<<20), e.P50us, e.P99us, e.P999us, rss, note)
+		hwm := "-"
+		if e.PeakRSSBytes > 0 {
+			hwm = fmt.Sprintf("%.1f", float64(e.PeakRSSBytes)/(1<<20))
+		}
+		cov := "-"
+		if e.CoverageSampled > 0 {
+			cov = fmt.Sprintf("%.1f", e.CoverageFraction*100)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%.0f\t%.0f\t%.1f\t%s\t%.1f\t%.1f\t%.1f\t%.1f\t%s\t%s\t%s\n",
+			e.Target, ver, e.OpsPerSec, e.ValueOpsPerSec, e.HitRatio*100, cov,
+			e.BytesPerSec/(1<<20), e.P50us, e.P99us, e.P999us, rss, hwm, note)
 	}
 	tw.Flush()
 
@@ -478,6 +552,30 @@ func (c Comparison) WriteTable(w io.Writer) {
 		}
 		fmt.Fprintf(w, "%s server window: maxmemory=%s policy=%s evicted=%d hits=%d misses=%d\n",
 			e.Target, limit, policy, e.EvictedKeys, e.ServerHits, e.ServerMisses)
+	}
+
+	// Dataset-coverage callout: the post-run retrievability probe, one line per
+	// probed target. This is the LTM fairness line the M0 gate lacked: it says
+	// in words how much of the written dataset the server still serves, so a
+	// high-ops rival that quietly evicted half the keyspace reads as a coverage
+	// well under 100% here rather than as throughput above. The peak footprint
+	// and per-retrievable-key cost ride along when they were measured.
+	for _, e := range []Entry{c.Aki, c.Redis, c.Valkey} {
+		if e.Skipped || e.CoverageSampled <= 0 {
+			continue
+		}
+		line := fmt.Sprintf("%s dataset coverage: %d/%d retrievable (%.1f%%)",
+			e.Target, e.CoverageRetrievable, e.CoverageSampled, e.CoverageFraction*100)
+		if e.CoverageMissing > 0 {
+			line += fmt.Sprintf(", %d missing", e.CoverageMissing)
+		}
+		if e.PeakRSSBytes > 0 {
+			line += fmt.Sprintf(", peak RSS %.1f MB", float64(e.PeakRSSBytes)/(1<<20))
+		}
+		if e.BytesPerRetrievableKey > 0 {
+			line += fmt.Sprintf(", %.0f bytes per retrievable key", e.BytesPerRetrievableKey)
+		}
+		fmt.Fprintln(w, line)
 	}
 
 	// Keyspace coverage callout: only for tracked uniform rows, and only when
