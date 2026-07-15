@@ -100,6 +100,34 @@ func RunStrings(targetName, addr string) Result {
 	return res
 }
 
+// RunSeed executes the seven-command seed smoke against addr. It exists for
+// the sqlo1 engine, whose S0 server (sqlo1srv) serves exactly PING, ECHO, SET,
+// GET, DEL, EXPIRE, and TTL; both wider smokes probe commands outside that
+// surface. The probe order mirrors the sqlo1 G5 seed script, so a server that
+// passes here also passes the one-command-startup gate's command sequence.
+func RunSeed(targetName, addr string) Result {
+	res := Result{Target: targetName}
+	cl, err := load.Dial(addr, 3*time.Second)
+	if err != nil {
+		res.Checks = append(res.Checks, Check{Name: "connect", OK: false, Detail: err.Error()})
+		return res
+	}
+	defer cl.Close()
+
+	prefix := "smoke:" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+
+	res.Checks = append(res.Checks,
+		probe(cl, "PING", [][]byte{[]byte("PING")}, isSimple("PONG")),
+		probe(cl, "ECHO", [][]byte{[]byte("ECHO"), []byte("hi")}, isBulk("hi")),
+		probe(cl, "SET", [][]byte{[]byte("SET"), []byte(prefix + "k"), []byte("v1")}, isSimple("OK")),
+		probe(cl, "GET", [][]byte{[]byte("GET"), []byte(prefix + "k")}, isBulk("v1")),
+		probe(cl, "EXPIRE", [][]byte{[]byte("EXPIRE"), []byte(prefix + "k"), []byte("100")}, isInt(1)),
+		probe(cl, "TTL", [][]byte{[]byte("TTL"), []byte(prefix + "k")}, isInt(100)),
+		probe(cl, "DEL", [][]byte{[]byte("DEL"), []byte(prefix + "k")}, isInt(1)),
+	)
+	return res
+}
+
 // matcher decides whether a reply value is the expected one.
 type matcher func(v any) (bool, string)
 
