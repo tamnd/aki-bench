@@ -105,3 +105,18 @@ func TestLaunchArgsF3(t *testing.T) {
 		t.Fatalf("f3srv must not receive the aki binary's flag shape: %v", args)
 	}
 }
+
+func TestLaunchArgsSqlo1(t *testing.T) {
+	// sqlo1srv's whole S0 flag surface is -addr and -store, and it runs on its
+	// shipped defaults, so the launch line must be the bare listen address: no
+	// server subcommand, no --dir, no appendonly flags, and no --aki-engine
+	// (the binary is the engine).
+	args := launchArgs(Aki, 6400, "/tmp/x", InMemory, "sqlo1", "")
+	want := []string{"-addr", "127.0.0.1:6400"}
+	if len(args) != len(want) || args[0] != want[0] || args[1] != want[1] {
+		t.Fatalf("sqlo1 launch args = %v, want %v", args, want)
+	}
+	if contains(args, "server") || contains(args, "--dir") || contains(args, "--appendonly") {
+		t.Fatalf("sqlo1srv must not receive the aki binary's flag shape: %v", args)
+	}
+}

@@ -61,7 +61,9 @@ type Spec struct {
 	// binary so a baseline never silently measures the wrong path. The f3 engine
 	// is the spec 2064/f3 rewrite, served by the f3srv binary; f3srv takes a bare
 	// --addr with no subcommand and no persistence flags (it is in-memory only in
-	// M0), so its launch line is its own case below.
+	// M0), so its launch line is its own case below. The sqlo1 engine is the spec
+	// 2064/sqlo1 driver, served by the sqlo1srv binary, whose S0 flag surface is
+	// just -addr; it too gets its own case.
 	AkiEngine string
 	AkiNet    string
 
@@ -273,6 +275,14 @@ func launchArgs(k Kind, port int, dataDir string, d Durability, akiEngine, akiNe
 		// and the data dir is only its working directory, set by the launcher.
 		if akiEngine == "f3" {
 			return []string{"--addr", "127.0.0.1:" + p}
+		}
+		// sqlo1srv is the spec 2064/sqlo1 driver's binary. In S0 its whole flag
+		// surface is -addr and -store, the store is the in-memory placeholder,
+		// and it writes nothing, so the data dir is only its working directory.
+		// When the single-file store lands the file will appear under that
+		// directory and the launcher's disk accounting picks it up unchanged.
+		if akiEngine == "sqlo1" {
+			return []string{"-addr", "127.0.0.1:" + p}
 		}
 		// aki's server subcommand takes a listen address and a working directory,
 		// and it speaks the same appendonly and appendfsync flags as Redis. Mapping

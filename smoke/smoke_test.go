@@ -91,6 +91,8 @@ func (s *tinyServer) handle(conn net.Conn) {
 			w.WriteString(":" + strconv.FormatInt(n, 10) + "\r\n")
 		case "EXPIRE":
 			w.WriteString(":1\r\n")
+		case "TTL":
+			w.WriteString(":100\r\n")
 		case "ECHO":
 			w.WriteString("$" + strconv.Itoa(len(argv[1])) + "\r\n" + argv[1] + "\r\n")
 		case "APPEND":
@@ -255,6 +257,48 @@ func TestStringsSmokeStaysInsideTheF3Surface(t *testing.T) {
 		verb := strings.SplitN(c.Name, "-", 2)[0]
 		if !served[verb] {
 			t.Errorf("probe %s is outside the f3srv M0 string surface", c.Name)
+		}
+	}
+}
+
+func TestSeedSmokePasses(t *testing.T) {
+	srv, err := newTinyServer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	res := smoke.RunSeed("fake", srv.addr())
+	if !res.Pass() {
+		for _, c := range res.Checks {
+			if !c.OK {
+				t.Errorf("check %s failed: %s", c.Name, c.Detail)
+			}
+		}
+		t.Fatal("expected all seed smoke checks to pass")
+	}
+}
+
+func TestSeedSmokeStaysInsideTheSqlo1Surface(t *testing.T) {
+	// The seed smoke exists because sqlo1srv serves exactly the seven S0 seed
+	// commands; a probe outside that surface would fail against a correct
+	// sqlo1srv and make the smoke useless as a launch check. Pin the probe set
+	// so a future probe addition trips this before it trips CI.
+	served := map[string]bool{
+		"PING": true, "ECHO": true, "SET": true, "GET": true,
+		"DEL": true, "EXPIRE": true, "TTL": true,
+	}
+	srv, err := newTinyServer(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+
+	res := smoke.RunSeed("fake", srv.addr())
+	for _, c := range res.Checks {
+		verb := strings.SplitN(c.Name, "-", 2)[0]
+		if !served[verb] {
+			t.Errorf("probe %s is outside the sqlo1srv S0 surface", c.Name)
 		}
 	}
 }
