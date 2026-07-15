@@ -155,7 +155,7 @@ FAILLOG="$OUTDIR/failures.txt"
 
 wait_up() { # port
   for _ in $(seq 1 300); do
-    if printf 'PING\r\n' | timeout 1 sh -c "exec 3<>/dev/tcp/127.0.0.1/$1 && cat >&3 && head -c 7 <&3" 2>/dev/null | grep -q PONG; then
+    if printf 'PING\r\n' | timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1 && cat >&3 && head -c 7 <&3" 2>/dev/null | grep -q PONG; then
       return 0
     fi
     sleep 0.2
