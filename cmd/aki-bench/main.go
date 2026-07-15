@@ -105,15 +105,18 @@ func run(args []string) error {
 		smokeOnly      = fs.Bool("smoke", false, "run the compatibility smoke check instead of a load run")
 		coverageSample = fs.Int("coverage-probe", 0, "after the measured window, sample this many random keys across the full keyspace and report the fraction retrievable with the correct length and content; 0 skips it. Only meaningful for a flat string workload (get, set, mixed, getrange). This is the larger-than-memory dataset-coverage check: a rival capped at maxmemory answers nil here for every key it evicted, so a high-ops run that silently dropped half its data shows a coverage well under 100%")
 
+		orderFlag = fs.String("order", "aki,redis,valkey", "measurement order of the three target slots, a permutation of aki,redis,valkey; the report always renders the canonical order, this only decides who is preloaded and measured first, so a multi-rep sweep can alternate it and cancel any first-mover advantage")
+
 		akiAddr    = fs.String("aki-addr", "", "connect to a running aki at host:port instead of launching")
 		redisAddr  = fs.String("redis-addr", "", "connect to a running redis at host:port instead of launching")
 		valkeyAddr = fs.String("valkey-addr", "", "connect to a running valkey at host:port instead of launching")
 		akiBin     = fs.String("aki-bin", "aki", "aki binary for launch mode with a legacy engine (btree, hybrid, hot)")
 		f1srvBin   = fs.String("f1srv-bin", "f1srv", "f1srv binary for launch mode with the f1raw engine (the default)")
 		f3srvBin   = fs.String("f3srv-bin", "f3srv", "f3srv binary for launch mode with the f3 engine (the spec 2064/f3 rewrite)")
+		sqlo1Bin   = fs.String("sqlo1srv-bin", "sqlo1srv", "sqlo1srv binary for launch mode with the sqlo1 engine (the spec 2064/sqlo1 driver)")
 		redisBin   = fs.String("redis-bin", "redis-server", "redis binary for launch mode")
 		valkeyBin  = fs.String("valkey-bin", "valkey-server", "valkey binary for launch mode")
-		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product), f3 (the spec 2064/f3 rewrite served by f3srv; strings only in M0, becomes the product at the M0 gate run), or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
+		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product), f3 (the spec 2064/f3 rewrite served by f3srv; strings only in M0, becomes the product at the M0 gate run), sqlo1 (the spec 2064/sqlo1 driver served by sqlo1srv; seven commands over a placeholder store in S0), or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
 		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
 
 		cpuSplit  = fs.Bool("cpu-split", true, "partition cores so the launched server and the load generator never share a core (Linux launch mode, on by default); removes the co-located-client starvation that understates the ratio; pass -cpu-split=false to co-locate")
@@ -151,6 +154,13 @@ func run(args []string) error {
 		return fmt.Errorf("bad -warm: negative duration")
 	}
 
+	// Validate the measurement order before any server is launched, so a typo
+	// fails fast instead of after a long preload.
+	order, err := parseOrder(*orderFlag)
+	if err != nil {
+		return err
+	}
+
 	valueSize, err := workload.ParseSize(*valueSizeTok)
 	if err != nil {
 		return fmt.Errorf("bad -value-size: %w", err)
@@ -171,6 +181,12 @@ func run(args []string) error {
 		fmt.Fprintf(os.Stderr, "durable mode: %s engine is in-memory only, using btree for a fair durable comparison\n", engine)
 		engine = "btree"
 	}
+	// sqlo1 gets no such fallback: btree is the aki product's engine, and
+	// silently measuring it under the sqlo1 name would be a different server
+	// wearing the row's label. Durable sqlo1 arrives with its own store.
+	if dur == target.Durable && engine == "sqlo1" {
+		return fmt.Errorf("durable mode: the sqlo1 engine has no durable config yet, drop -durable or pick another engine")
+	}
 
 	// f1raw is the default fast engine and it is served by its own binary, f1srv,
 	// not the aki binary. The f3 rewrite is likewise served by its own binary,
@@ -183,6 +199,8 @@ func run(args []string) error {
 		akiServerBin = *f1srvBin
 	case "f3":
 		akiServerBin = *f3srvBin
+	case "sqlo1":
+		akiServerBin = *sqlo1Bin
 	}
 
 	// Pin the launched server and this load generator to disjoint cores when
@@ -217,10 +235,11 @@ func run(args []string) error {
 	}
 
 	if *smokeOnly {
-		// f3srv serves the M0 string surface only, so the smoke sticks to string
-		// probes. The same reduced set runs against every present target so all
+		// f3srv serves the M0 string surface only and sqlo1srv serves the seven
+		// S0 seed commands only, so the smoke narrows to the aki slot's served
+		// surface. The same reduced set runs against every present target so all
 		// three are checked on identical round-trips.
-		return runSmoke(targets, engine == "f3")
+		return runSmoke(targets, engine)
 	}
 
 	spec := workload.Spec{
@@ -437,10 +456,17 @@ func run(args []string) error {
 		return row
 	}
 
+	// Measure the slots in the requested order; assembly below stays canonical.
+	// The slot name doubles as the row label, and Kind's string values are
+	// exactly those labels.
+	rows := map[target.Kind]report.Entry{}
+	for _, k := range order {
+		rows[k] = entry(k, string(k))
+	}
 	cmp := report.NewComparison(*wl,
-		entry(target.Aki, "aki"),
-		entry(target.Redis, "redis"),
-		entry(target.Valkey, "valkey"),
+		rows[target.Aki],
+		rows[target.Redis],
+		rows[target.Valkey],
 		*required,
 	)
 	// The cell tuple travels with the result so a row is quotable as the shape
@@ -575,6 +601,33 @@ func coverableWorkload(name string) bool {
 	}
 }
 
+// parseOrder turns the -order flag into the sequence the three target slots are
+// measured in. It accepts exactly a permutation of aki,redis,valkey: a subset
+// would silently drop a row and a repeat would measure one server twice under
+// the same label, so both are errors rather than best-effort parses.
+func parseOrder(s string) ([]target.Kind, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("bad -order %q: need a permutation of aki,redis,valkey", s)
+	}
+	seen := map[target.Kind]bool{}
+	out := make([]target.Kind, 0, 3)
+	for _, p := range parts {
+		k := target.Kind(strings.TrimSpace(p))
+		switch k {
+		case target.Aki, target.Redis, target.Valkey:
+		default:
+			return nil, fmt.Errorf("bad -order %q: unknown target %q", s, p)
+		}
+		if seen[k] {
+			return nil, fmt.Errorf("bad -order %q: %q appears twice", s, p)
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out, nil
+}
+
 // isPlanWorkload reports whether name is a collection point-read plan, which is
 // what decides where the -card preset lands: a plan's cardinality is its member
 // count, a flat workload's is its key space.
@@ -587,7 +640,7 @@ func isPlanWorkload(name string) bool {
 	return false
 }
 
-func runSmoke(targets map[target.Kind]*target.Target, stringsOnly bool) error {
+func runSmoke(targets map[target.Kind]*target.Target, engine string) error {
 	names := map[target.Kind]string{target.Aki: "aki", target.Redis: "redis", target.Valkey: "valkey"}
 	allPass := true
 	for _, k := range []target.Kind{target.Aki, target.Redis, target.Valkey} {
@@ -596,9 +649,12 @@ func runSmoke(targets map[target.Kind]*target.Target, stringsOnly bool) error {
 			continue
 		}
 		var res smoke.Result
-		if stringsOnly {
+		switch engine {
+		case "f3":
 			res = smoke.RunStrings(names[k], t.Addr)
-		} else {
+		case "sqlo1":
+			res = smoke.RunSeed(names[k], t.Addr)
+		default:
 			res = smoke.Run(names[k], t.Addr)
 		}
 		status := "PASS"
