@@ -190,7 +190,7 @@ for scale in $SCALES; do
     if [ $((rep % 2)) = 1 ]; then order="aki,redis,valkey"; else order="valkey,redis,aki"; fi
     cell="$arm-r$mix-v$vs-$dist-${scale}x-rep$rep"
     celldir="$WORK/$cell"
-    mkdir -p "$celldir/aki" "$celldir/redis" "$celldir/valkey"
+    mkdir -p "$celldir/aki/vlog" "$celldir/redis" "$celldir/valkey"
 
     rival_flags=(--bind 127.0.0.1 --save "" --appendonly no --io-threads "$IO_THREADS")
     if [ "$arm" = cap ]; then
