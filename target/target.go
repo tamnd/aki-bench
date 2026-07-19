@@ -53,17 +53,17 @@ type Spec struct {
 
 	// AkiEngine and AkiNet select aki's storage engine and networking model for
 	// the string point path (the -aki-engine and -aki-net server flags). They are
-	// ignored for Redis and Valkey. The default engine is f1raw, the fast
-	// clean-room single-tier engine that is the product; it is served by the f1srv
-	// binary, which accepts the same `server --addr ...` flag shape as the aki
-	// binary so the launch path is identical. The legacy engines (btree, hybrid,
-	// hot) are slower and served by the aki binary; the caller picks the matching
-	// binary so a baseline never silently measures the wrong path. The f3 engine
-	// is the spec 2064/f3 rewrite, served by the f3srv binary; f3srv takes a bare
-	// --addr with no subcommand and no persistence flags (it is in-memory only in
-	// M0), so its launch line is its own case below. The sqlo1 engine is the spec
-	// 2064/sqlo1 driver, served by the sqlo1srv binary, whose S0 flag surface is
-	// just -addr; it too gets its own case.
+	// ignored for Redis and Valkey. The default engine is f3, the spec 2064/f3
+	// sharded clean-room rewrite that is the product; it is served by the f3srv
+	// binary, which takes a bare --addr with no subcommand and no persistence flags
+	// (in-memory only), so its launch line is its own case below. f1raw is the prior
+	// single-tier engine, served by the f1srv binary, which accepts the same
+	// `server --addr ...` flag shape as the aki binary so that launch path is
+	// identical. The legacy engines (btree, hybrid, hot) are slower and served by
+	// the aki binary; the caller picks the matching binary so a baseline never
+	// silently measures the wrong path. The sqlo1 engine is the spec 2064/sqlo1
+	// driver, served by the sqlo1srv binary, whose S0 flag surface is just -addr;
+	// it too gets its own case.
 	AkiEngine string
 	AkiNet    string
 
