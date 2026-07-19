@@ -65,8 +65,11 @@ Launch all three servers and run the SET workload for five seconds:
 aki-bench -workload set -connections 50 -pipeline 1 -duration 5s
 ```
 
-This needs `aki`, `redis-server`, and `valkey-server` on your PATH.
+This needs `f3srv`, `redis-server`, and `valkey-server` on your PATH.
 Any target whose binary is missing is skipped, and the run continues with the rest.
+
+Launch mode runs the f3 engine by default, the spec 2064/f3 sharded clean-room rewrite that is the product, served by `f3srv`.
+Pass `-aki-engine f1raw` for the prior single-tier engine (served by `f1srv`), `-aki-engine sqlo1` for the sqlo1 driver (served by `sqlo1srv`), or a legacy engine (`btree`, `hybrid`, `hot`, served by the `aki` binary).
 
 Point at servers you already have running instead of launching them:
 
