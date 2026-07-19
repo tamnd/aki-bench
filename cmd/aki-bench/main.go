@@ -105,14 +105,15 @@ func run(args []string) error {
 		redisAddr  = fs.String("redis-addr", "", "connect to a running redis at host:port instead of launching")
 		valkeyAddr = fs.String("valkey-addr", "", "connect to a running valkey at host:port instead of launching")
 		akiBin     = fs.String("aki-bin", "aki", "aki binary for launch mode with a legacy engine (btree, hybrid, hot)")
-		f1srvBin   = fs.String("f1srv-bin", "f1srv", "f1srv binary for launch mode with the f1raw engine (the default)")
+		f1srvBin   = fs.String("f1srv-bin", "f1srv", "f1srv binary for launch mode with the f1raw engine")
+		f3srvBin   = fs.String("f3srv-bin", "f3srv", "f3srv binary for launch mode with the f3 engine (the default)")
 		redisBin   = fs.String("redis-bin", "redis-server", "redis binary for launch mode")
 		valkeyBin  = fs.String("valkey-bin", "valkey-server", "valkey binary for launch mode")
-		akiEngine  = fs.String("aki-engine", "f1raw", "aki engine in launch mode: f1raw (default, the fast clean-room single-tier engine served by f1srv; this is the product) or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
+		akiEngine  = fs.String("aki-engine", "f3", "aki engine in launch mode: f3 (default, the sharded clean-room engine served by f3srv; this is the product), f1raw (the prior single-tier engine served by f1srv), or a legacy slower engine (btree, hybrid, hot) served by the aki binary")
 		akiNet     = fs.String("aki-net", "", "aki networking model in launch mode: empty for the default goroutine loop, reactor, or uring (Linux only)")
 
-		setAlgebraMerge = fs.Bool("set-algebra-merge", true, "launch f1srv with -set-algebra-merge so SINTER/SDIFF/SINTERCARD run the doc-24 sorted two-pointer merge, the product path the set-algebra 2x gate measures; on by default, pass -set-algebra-merge=false to measure the point-probe. Only applies to the f1raw engine; a legacy engine ignores it")
-		akiExtraArgs    = fs.String("aki-extra-args", "", "extra server flags passed verbatim to a launched aki or f1srv, space-separated, for example \"-ltm-cold -arena-segmented\"; appended after the engine flags and ignored for Redis and Valkey")
+		setAlgebraMerge = fs.Bool("set-algebra-merge", true, "launch f1srv with -set-algebra-merge so SINTER/SDIFF/SINTERCARD run the doc-24 sorted two-pointer merge, the product path the set-algebra 2x gate measures; on by default, pass -set-algebra-merge=false to measure the point-probe. Only applies to the f1raw engine; f3 and the legacy engines ignore it")
+		akiExtraArgs    = fs.String("aki-extra-args", "", "extra server flags passed verbatim to a launched aki, f1srv, or f3srv, space-separated, for example \"-shards 8 -net reactor\" for f3srv or \"-ltm-cold\" for f1srv; appended after the engine flags and ignored for Redis and Valkey")
 
 		cpuSplit  = fs.Bool("cpu-split", true, "partition cores so the launched server and the load generator never share a core (Linux launch mode, on by default); removes the co-located-client starvation that understates the ratio; pass -cpu-split=false to co-locate")
 		cpuServer = fs.String("cpu-server", "", "taskset -c list for the server half of -cpu-split, for example 0-3; empty auto-derives from the core count")
@@ -152,17 +153,21 @@ func run(args []string) error {
 	// fall back to the durable B-tree and say so, rather than quietly reporting an
 	// unfair win.
 	engine := *akiEngine
-	if dur == target.Durable && (engine == "f1raw" || engine == "hot" || engine == "hybrid") {
+	if dur == target.Durable && (engine == "f3" || engine == "f1raw" || engine == "hot" || engine == "hybrid") {
 		fmt.Fprintf(os.Stderr, "durable mode: %s engine is in-memory only, using btree for a fair durable comparison\n", engine)
 		engine = "btree"
 	}
 
-	// f1raw is the default fast engine and it is served by its own binary, f1srv,
-	// not the aki binary. The legacy engines (btree, hybrid, hot) are served by the
-	// aki binary through its --aki-engine flag. Pick the binary that matches the
-	// engine so launch mode never points the wrong server at the engine name.
+	// f3 is the default engine and it is served by its own binary, f3srv. f1raw is
+	// the prior fast engine served by f1srv. The legacy engines (btree, hybrid, hot)
+	// are served by the aki binary through its --aki-engine flag. Pick the binary
+	// that matches the engine so launch mode never points the wrong server at the
+	// engine name.
 	akiServerBin := *akiBin
-	if engine == "f1raw" {
+	switch engine {
+	case "f3":
+		akiServerBin = *f3srvBin
+	case "f1raw":
 		akiServerBin = *f1srvBin
 	}
 
@@ -228,13 +233,18 @@ func run(args []string) error {
 		return fmt.Errorf("unknown -dist %q, choose uniform or zipfian", *dist)
 	}
 
-	// A workload is either a flat generator (get/set/...) or a collection
-	// point-read plan (sismember/hget/zscore/zrank). A plan has a preload phase
-	// that builds the single probed collection before the measured reads.
-	gen := workload.Build(*wl, spec)
-	plan, isPlan := workload.BuildPlan(*wl, spec)
-	if gen == nil && !isPlan {
-		return fmt.Errorf("unknown workload %q, choose one of %s", *wl, strings.Join(allWorkloadNames(), ", "))
+	// -workload takes one name or a comma-separated list. A list that shares a preload
+	// (the seven set-algebra forms all build the same two source sets) is a suite: the
+	// harness builds the sources once per target and probes them with every form,
+	// instead of paying the multi-million-member preload once per command. Resolve and
+	// validate every name up front so a typo fails before any server work.
+	names := splitWorkloads(*wl)
+	if len(names) == 0 {
+		return fmt.Errorf("empty -workload")
+	}
+	groups, err := planGroups(names, spec)
+	if err != nil {
+		return err
 	}
 
 	mode := load.ClosedLoop
@@ -242,112 +252,198 @@ func run(args []string) error {
 		mode = load.OpenLoop
 	}
 
-	entry := func(k target.Kind, name string) report.Entry {
+	// runTarget builds every group's keyspace once and runs each probe in it against
+	// the same preload, returning one entry per workload name. A missing target yields
+	// a Skipped entry for every workload; a flush or preload failure skips just that
+	// group's workloads. The keyspace is flushed per group so each group is measured on
+	// a clean slate, matching the isolation a one-workload-per-process run gave.
+	runTarget := func(k target.Kind, label string) map[string]report.Entry {
+		out := make(map[string]report.Entry, len(names))
 		t, ok := targets[k]
 		if !ok {
-			return report.Skipped(name, *wl)
-		}
-		// Start every target from an identical empty keyspace. When aki-bench
-		// launches its own servers they are already empty, but when it connects to a
-		// persistent reference (a redis or valkey left running across runs via
-		// -redis-addr/-valkey-addr) that server still holds the previous run's keys.
-		// A hgetall run that preloads a 100-field hash onto a reference that already
-		// holds a 100k-field hash from a prior sweep then measures aki against a hash
-		// two orders larger, a silent apples-to-oranges comparison. Flushing first
-		// makes the preload authoritative for the shape every target is measured on.
-		if err := flushTarget(t.Addr); err != nil {
-			fmt.Fprintf(os.Stderr, "flush %s: %v\n", k, err)
-			return report.Skipped(name, *wl)
-		}
-		// For a collection plan, build the probed collection first. The preload
-		// runs on one connection so a single sequence 0..PreloadOps-1 populates
-		// every member exactly once; a multi-connection preload would restart the
-		// sequence per connection and under-populate the collection.
-		probe := gen
-		if isPlan {
-			pre := load.Config{
-				Addr:        t.Addr,
-				Connections: 1,
-				Pipeline:    256,
-				Duration:    0,
-				Requests:    plan.PreloadOps,
-				Mode:        load.ClosedLoop,
-				Gen:         plan.Preload,
+			for _, n := range names {
+				out[n] = report.Skipped(label, n)
 			}
-			if _, err := load.Run(context.Background(), pre); err != nil {
-				fmt.Fprintf(os.Stderr, "preload %s: %v\n", k, err)
-				return report.Skipped(name, *wl)
-			}
-			probe = plan.Probe
-		} else if preGen, preOps, ok := workload.PreloadFor(*wl, spec); ok {
-			// Flat read workloads (get, mixed) need their key space populated, or
-			// every read is a miss that short-circuits before storage. Walk the key
-			// space once on a single connection so every key exists, then time the
-			// reads against a warm store, matching the collection-plan preload.
-			pre := load.Config{
-				Addr:        t.Addr,
-				Connections: 1,
-				Pipeline:    256,
-				Duration:    0,
-				Requests:    preOps,
-				Mode:        load.ClosedLoop,
-				Gen:         preGen,
-			}
-			if _, err := load.Run(context.Background(), pre); err != nil {
-				fmt.Fprintf(os.Stderr, "preload %s: %v\n", k, err)
-				return report.Skipped(name, *wl)
-			}
+			return out
 		}
-		cfg := load.Config{
-			Addr:        t.Addr,
-			Connections: *conns,
-			Pipeline:    *pipeline,
-			Duration:    duration,
-			Requests:    *requests,
-			Mode:        mode,
-			TargetRate:  *targetRate,
-			Gen:         probe,
-		}
-		// Probe the live server's self-reported version before the load so the
-		// report records the exact build measured, not the binary name on PATH.
-		// A failed probe is not fatal: it just leaves the version blank.
+		// Probe the live server's self-reported version once so the report records the
+		// exact build measured, not the binary name on PATH. A failed probe is not
+		// fatal: it just leaves the version blank.
 		var version string
 		if info, perr := load.ProbeServer(t.Addr, 2*time.Second); perr == nil {
 			version = info.String()
 		} else {
 			fmt.Fprintf(os.Stderr, "version probe %s: %v\n", k, perr)
 		}
-		res, err := load.Run(context.Background(), cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "run %s: %v\n", k, err)
-			return report.Skipped(name, *wl).WithVersion(version)
+		for _, g := range groups {
+			skipGroup := func(reason string, err error) {
+				fmt.Fprintf(os.Stderr, "%s %s: %v\n", reason, k, err)
+				for _, p := range g.probes {
+					out[p.name] = report.Skipped(label, p.name).WithVersion(version)
+				}
+			}
+			// Start from an identical empty keyspace. A launched server is already
+			// empty, but a persistent reference (-redis-addr/-valkey-addr) still holds
+			// the previous group's keys; flushing makes this group's preload
+			// authoritative for the shape every target is measured on.
+			if err := flushTarget(t.Addr); err != nil {
+				skipGroup("flush", err)
+				continue
+			}
+			// Build the group's keyspace once on a single connection so a sequence
+			// 0..PreloadOps-1 covers every member exactly once; a multi-connection
+			// preload would restart the sequence per connection and under-populate it.
+			if g.preload != nil {
+				pre := load.Config{
+					Addr:        t.Addr,
+					Connections: 1,
+					Pipeline:    256,
+					Duration:    0,
+					Requests:    g.preloadOps,
+					Mode:        load.ClosedLoop,
+					Gen:         g.preload,
+				}
+				if _, err := load.Run(context.Background(), pre); err != nil {
+					skipGroup("preload", err)
+					continue
+				}
+			}
+			for _, p := range g.probes {
+				cfg := load.Config{
+					Addr:        t.Addr,
+					Connections: *conns,
+					Pipeline:    *pipeline,
+					Duration:    duration,
+					Requests:    *requests,
+					Mode:        mode,
+					TargetRate:  *targetRate,
+					Gen:         p.probe,
+				}
+				res, err := load.Run(context.Background(), cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "run %s %s: %v\n", k, p.name, err)
+					out[p.name] = report.Skipped(label, p.name).WithVersion(version)
+					continue
+				}
+				out[p.name] = report.FromResult(label, p.name, res).WithVersion(version)
+			}
 		}
-		return report.FromResult(name, *wl, res).WithVersion(version)
+		return out
 	}
 
-	cmp := report.NewComparison(*wl,
-		entry(target.Aki, "aki"),
-		entry(target.Redis, "redis"),
-		entry(target.Valkey, "valkey"),
-		*required,
-	)
-	cmp.WriteTable(os.Stdout)
+	akiRes := runTarget(target.Aki, "aki")
+	redisRes := runTarget(target.Redis, "redis")
+	valkeyRes := runTarget(target.Valkey, "valkey")
 
-	if *jsonOut != "" {
-		f, err := os.Create(*jsonOut)
-		if err != nil {
-			return err
+	gateFail := false
+	for _, n := range names {
+		cmp := report.NewComparison(n, akiRes[n], redisRes[n], valkeyRes[n], *required)
+		cmp.WriteTable(os.Stdout)
+		if *jsonOut != "" {
+			path := *jsonOut
+			if len(names) > 1 {
+				path = suffixJSONPath(*jsonOut, n)
+			}
+			if err := writeComparisonJSON(cmp, path); err != nil {
+				return err
+			}
 		}
-		defer f.Close()
-		if err := cmp.WriteJSON(f); err != nil {
-			return err
+		if !cmp.Gate.Pass {
+			gateFail = true
 		}
 	}
-
-	if !cmp.Gate.Pass {
+	if gateFail {
 		return errGateNotMet
 	}
 	return nil
+}
+
+// probeItem pairs a workload name with the generator that gets timed for it.
+type probeItem struct {
+	name  string
+	probe load.CommandGen
+}
+
+// preGroup is a set of probes that share one preload phase. The preload builds the
+// keyspace once and every probe in the group is measured against it. A flat write
+// workload or a stand-alone plan is a group of one with its own (possibly nil)
+// preload; the set-algebra forms collapse into a single group keyed by their shared
+// PreloadKey.
+type preGroup struct {
+	preload    load.CommandGen
+	preloadOps int64
+	probes     []probeItem
+}
+
+// splitWorkloads parses the comma-separated -workload value into a trimmed,
+// empty-dropped list, preserving order.
+func splitWorkloads(s string) []string {
+	var out []string
+	for part := range strings.SplitSeq(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// planGroups resolves every workload name into probes and buckets them into preload
+// groups. Plans that declare the same non-empty PreloadKey join one group so their
+// shared source keyspace is built once; every other workload is its own group. It
+// fails if any name is neither a flat generator nor a collection plan.
+func planGroups(names []string, spec workload.Spec) ([]*preGroup, error) {
+	var groups []*preGroup
+	byKey := map[string]*preGroup{}
+	for _, n := range names {
+		gen := workload.Build(n, spec)
+		plan, isPlan := workload.BuildPlan(n, spec)
+		if gen == nil && !isPlan {
+			return nil, fmt.Errorf("unknown workload %q, choose one of %s", n, strings.Join(allWorkloadNames(), ", "))
+		}
+		if isPlan {
+			if plan.PreloadKey != "" {
+				if g, ok := byKey[plan.PreloadKey]; ok {
+					g.probes = append(g.probes, probeItem{name: n, probe: plan.Probe})
+					continue
+				}
+			}
+			g := &preGroup{preload: plan.Preload, preloadOps: plan.PreloadOps, probes: []probeItem{{name: n, probe: plan.Probe}}}
+			groups = append(groups, g)
+			if plan.PreloadKey != "" {
+				byKey[plan.PreloadKey] = g
+			}
+			continue
+		}
+		// Flat generator. Read workloads (get, getrange, mixed) need their key space
+		// populated first; write workloads have no preload.
+		g := &preGroup{probes: []probeItem{{name: n, probe: gen}}}
+		if preGen, preOps, ok := workload.PreloadFor(n, spec); ok {
+			g.preload = preGen
+			g.preloadOps = preOps
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+// suffixJSONPath inserts a workload name before the extension of a JSON output path
+// so a multi-workload suite writes one file per workload instead of overwriting a
+// single file. "out.json" with "sinter" becomes "out-sinter.json".
+func suffixJSONPath(path, name string) string {
+	if i := strings.LastIndex(path, "."); i >= 0 {
+		return path[:i] + "-" + name + path[i:]
+	}
+	return path + "-" + name
+}
+
+// writeComparisonJSON writes one comparison to a file.
+func writeComparisonJSON(cmp report.Comparison, path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return cmp.WriteJSON(f)
 }
 
 // cpuServerEnv carries the chosen server core list across the re-exec that pins

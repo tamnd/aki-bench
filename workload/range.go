@@ -192,6 +192,14 @@ var (
 	setDest = []byte("set:" + collKey + ":out")
 )
 
+// algebraPreloadKey groups all seven set-algebra plans so a suite run builds the two
+// source sets once and probes them with every form. They are interchangeable on the
+// preload: identical algebraPreload generator and identical PreloadOps for a given
+// Spec, differing only in the probe. The STORE forms write setDest during the timed
+// probe, never a source, so running the reads and then the stores against one preload
+// leaves the sources intact for the whole suite.
+const algebraPreloadKey = "setalgebra"
+
 // algebraPreload populates two half-overlapping sets over one sequential pass. Even
 // sequence steps write set a over m0..m{members-1}, odd steps write set b over the shifted
 // range m{members/2}..m{members+members/2-1}, so each set ends with members distinct members
@@ -227,6 +235,7 @@ func SInter(s Spec) Plan {
 	argv := [][]byte{sinter, setAKey, setBKey}
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
+		PreloadKey: algebraPreloadKey,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return argv
@@ -245,6 +254,7 @@ func SUnion(s Spec) Plan {
 	argv := [][]byte{sunion, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
+		PreloadKey: algebraPreloadKey,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return argv
@@ -264,6 +274,7 @@ func SDiff(s Spec) Plan {
 	argv := [][]byte{sdiff, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
+		PreloadKey: algebraPreloadKey,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return argv
@@ -284,6 +295,7 @@ func SInterCard(s Spec) Plan {
 	argv := [][]byte{sintercard, two, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
+		PreloadKey: algebraPreloadKey,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return argv
@@ -304,6 +316,7 @@ func SInterStore(s Spec) Plan {
 	argv := [][]byte{sinterstore, setDest, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
+		PreloadKey: algebraPreloadKey,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return argv
@@ -324,6 +337,7 @@ func SUnionStore(s Spec) Plan {
 	argv := [][]byte{sunionstore, setDest, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
+		PreloadKey: algebraPreloadKey,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return argv
@@ -342,6 +356,7 @@ func SDiffStore(s Spec) Plan {
 	argv := [][]byte{sdiffstore, setDest, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
+		PreloadKey: algebraPreloadKey,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
 			return argv

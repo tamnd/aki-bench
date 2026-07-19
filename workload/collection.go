@@ -23,6 +23,16 @@ type Plan struct {
 	Preload    load.CommandGen
 	Probe      load.CommandGen
 	PreloadOps int64
+
+	// PreloadKey groups plans that build an identical keyspace so the harness can
+	// preload once and run every probe in the group against it. Two plans with the
+	// same non-empty key must have interchangeable Preload generators and PreloadOps
+	// for a given Spec (same commands, same coverage). The set-algebra plans all share
+	// one key because they build the same two source sets and only differ in the probe
+	// they issue, so a suite run preloads the sources once instead of rebuilding them
+	// per command, which at millions of members is the whole wall-clock. An empty key
+	// means the plan stands alone and is always preloaded fresh.
+	PreloadKey string
 }
 
 // collKey is the single collection every point-read plan targets. One large

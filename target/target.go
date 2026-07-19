@@ -51,14 +51,15 @@ type Spec struct {
 	Addr       string     // host:port for connect mode; empty means launch
 	Durability Durability // fairness config for launch mode
 
-	// AkiEngine and AkiNet select aki's storage engine and networking model for
-	// the string point path (the -aki-engine and -aki-net server flags). They are
-	// ignored for Redis and Valkey. The default engine is f1raw, the fast
-	// clean-room single-tier engine that is the product; it is served by the f1srv
-	// binary, which accepts the same `server --addr ...` flag shape as the aki
-	// binary so the launch path is identical. The legacy engines (btree, hybrid,
-	// hot) are slower and served by the aki binary; the caller picks the matching
-	// binary so a baseline never silently measures the wrong path.
+	// AkiEngine and AkiNet select aki's storage engine and networking model. They
+	// are ignored for Redis and Valkey. The default engine is f3, the sharded
+	// clean-room engine that is the product; it is served by the f3srv binary,
+	// which has its own single-dash CLI shape (-addr, -net, no `server`
+	// subcommand). f1raw is the prior single-tier engine served by f1srv, which
+	// shares the aki binary's `server --addr ...` flag shape. The legacy engines
+	// (btree, hybrid, hot) are slower and served by the aki binary. The caller
+	// picks the matching binary so a baseline never silently measures the wrong
+	// path, and launchArgs branches on the engine so each server gets its own flags.
 	AkiEngine string
 	AkiNet    string
 
@@ -249,10 +250,25 @@ func launchArgs(k Kind, port int, dataDir string, d Durability, akiEngine, akiNe
 	p := strconv.Itoa(port)
 	switch k {
 	case Aki:
-		// aki's server subcommand takes a listen address and a working directory,
-		// and it speaks the same appendonly and appendfsync flags as Redis. Mapping
-		// durability through those flags keeps the fairness config identical across
-		// all three servers.
+		// f3srv, the product's server, has a different CLI shape than the aki
+		// binary and f1srv: single-dash flags, no `server` subcommand, no working
+		// directory, and `-net` for the networking model. It is in-memory here (the
+		// durable path falls back to the btree engine upstream for a fair
+		// durable-vs-durable number), so it takes no appendonly flags. The gate
+		// tuning (-shards, -arena-mib, reactor knobs) rides in through akiExtra so
+		// the default launch measures f3srv on its own defaults.
+		if akiEngine == "f3" {
+			args := []string{"-addr", "127.0.0.1:" + p}
+			if akiNet != "" {
+				args = append(args, "-net", akiNet)
+			}
+			args = append(args, akiExtra...)
+			return args
+		}
+		// The aki binary and f1srv share a `server` subcommand that takes a listen
+		// address and a working directory, and they speak the same appendonly and
+		// appendfsync flags as Redis. Mapping durability through those flags keeps
+		// the fairness config identical across all three servers.
 		args := []string{"server", "--addr", "127.0.0.1:" + p, "--dir", dataDir}
 		if d == Durable {
 			args = append(args, "--appendonly", "yes", "--appendfsync", "always")

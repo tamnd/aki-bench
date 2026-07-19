@@ -93,6 +93,39 @@ func TestLaunchArgsFairness(t *testing.T) {
 	}
 }
 
+// TestLaunchArgsF3 checks the f3 engine gets f3srv's own CLI shape, which differs
+// from the aki binary and f1srv: single-dash -addr and -net, no `server`
+// subcommand, no --dir, and no appendonly flags (f3 launches in-memory here).
+func TestLaunchArgsF3(t *testing.T) {
+	f3 := launchArgs(Aki, 6400, "/tmp/x", InMemory, "f3", "reactor", []string{"-shards", "8"})
+	if !contains(f3, "-addr") || !contains(f3, "127.0.0.1:6400") {
+		t.Fatalf("f3 should listen on the chosen addr with a single-dash -addr: %v", f3)
+	}
+	if !contains(f3, "-net") || !contains(f3, "reactor") {
+		t.Fatalf("f3 should pass the net model through -net: %v", f3)
+	}
+	if !contains(f3, "-shards") || !contains(f3, "8") {
+		t.Fatalf("f3 should append extra args verbatim: %v", f3)
+	}
+	if contains(f3, "server") {
+		t.Fatalf("f3srv has no server subcommand: %v", f3)
+	}
+	if contains(f3, "--dir") || contains(f3, "--addr") || contains(f3, "--aki-engine") {
+		t.Fatalf("f3srv does not take the aki-binary flag shape: %v", f3)
+	}
+	if contains(f3, "--appendonly") || contains(f3, "yes") || contains(f3, "no") {
+		t.Fatalf("f3 launches in-memory, no appendonly flags: %v", f3)
+	}
+
+	// A durable request still reaches launchArgs as InMemory for f3 because the
+	// engine falls back to btree upstream, so this path never needs appendonly.
+	// f1raw keeps the server-subcommand shape it always had.
+	f1 := launchArgs(Aki, 6400, "/tmp/x", InMemory, "f1raw", "", nil)
+	if !contains(f1, "server") || !contains(f1, "--dir") {
+		t.Fatalf("f1raw should keep the server-subcommand shape: %v", f1)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
