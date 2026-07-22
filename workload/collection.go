@@ -38,6 +38,37 @@ func memberName(idx int64) []byte {
 	return []byte("m" + strconv.FormatInt(idx, 10))
 }
 
+// refillName is a member name a non-draining destructive probe re-adds so the
+// collection never empties (sustained below). It is unique per (conn, seq): every
+// connection re-adds its own names, so a re-add is always a genuine new member and
+// never collides with another connection's, which is what keeps adds and pops in
+// balance. A colliding name would make the re-add a no-op while the pop still
+// removed a member, so pops would outrun adds and the collection would drain after
+// all, the artifact this probe exists to avoid.
+func refillName(conn int, seq int64) []byte {
+	return []byte("mu" + strconv.Itoa(conn) + "-" + strconv.FormatInt(seq, 10))
+}
+
+// sustained turns a destructive probe into a non-draining one by alternating a
+// re-add with the pop on seq parity: even seq re-adds, odd seq pops. Half the
+// operations repopulate the collection and half consume it, so its cardinality
+// holds near the preload for the whole run and the pop keeps hitting a populated
+// collection, which is the cost the gate row wants to measure. It also keeps
+// value-bearing ops off zero: a pure drain empties the collection and every later
+// pop returns nil, so all three servers report zero value-bearing throughput and
+// the gate cannot score a ratio (report.gateOpsPerSec). All three servers run the
+// identical add/pop mix, so the comparison stays fair. The measured figure is the
+// sustained pop-under-replacement rate, not the pure-drain rate, which is the only
+// honest way to hold a destructive op's collection populated one command at a time.
+func sustained(readd, pop load.CommandGen) load.CommandGen {
+	return func(conn int, seq int64) [][]byte {
+		if seq&1 == 0 {
+			return readd(conn, seq)
+		}
+		return pop(conn, seq)
+	}
+}
+
 // SISMember builds a set of Members elements and probes it with SISMEMBER.
 func SISMember(s Spec) Plan {
 	s = s.withDefaults()

@@ -134,22 +134,24 @@ func LRem(s Spec) Plan {
 }
 
 // RPopLPush builds a list of Members elements and probes it with RPOPLPUSH from
-// listProbeKey into a sibling destination list, the two-key atomic move. It is the
-// first list write that touches two collections at once, so it exercises the two-key
-// path the point ops never needed: pop the source tail and push it onto the
-// destination head while both header counts stay in step. Like LPop it drains the
-// source over a sustained run, one element per probe; the destination grows to mirror
-// it, so it measures the populated move cost throughout, and once the source drains
-// RPOPLPUSH returns nil on the same cheap empty path across all three servers.
+// listProbeKey back onto itself, the atomic pop-tail-push-head move. The same-key
+// form is a rotation: it pops the tail and pushes it onto the head in one atomic
+// step, so the list length is exactly constant and every probe returns the rotated
+// element, never nil. That exercises the identical pop-and-push move machinery a
+// two-key RPOPLPUSH runs (locate the tail, unlink it, relink it at the head, keep
+// the header count in step) without the drain a distinct destination causes: a
+// source-into-sibling move empties the source over a sustained run, and once it
+// drains RPOPLPUSH returns nil on the same cheap path for all three servers, zeroing
+// value-bearing throughput so the gate cannot score it. The cross-shard two-key move
+// is a topology concern covered in the engine suite, not this throughput cell.
 func RPopLPush(s Spec) Plan {
 	s = s.withDefaults()
 	rpoplpush := []byte("RPOPLPUSH")
-	dstKey := []byte("list:" + collKey + ":moved")
 	return Plan{
 		PreloadOps: int64(s.Members),
 		Preload:    listPreload(),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{rpoplpush, listProbeKey, dstKey}
+			return [][]byte{rpoplpush, listProbeKey, listProbeKey}
 		},
 	}
 }

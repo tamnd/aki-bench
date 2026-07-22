@@ -86,12 +86,16 @@ func XRead(s Spec) Plan {
 // every later seq issues an XADD. The create uses a start id of 0 so all the
 // added entries count as undelivered and the probe's `>` selector delivers them.
 //
-// XREADGROUP with `>` is destructive in the same sense LPOP is: each delivered
-// entry moves into the consumer's pending list and `>` will not return it again,
-// so a sustained run drains the undelivered entries and then returns nil. That nil
-// path is the same cheap reply on aki, Redis, and Valkey alike, so a drained tail
-// keeps the ratio fair the way the LPOP drain does; size -members at or above the
-// op budget for a run that delivers a populated batch throughout.
+// The probe is non-draining (sustained): XREADGROUP with `>` moves each delivered
+// entry into the consumer's pending list and never returns it again, so a bare
+// drain empties the undelivered pool and then returns nil on the same cheap reply
+// across aki, Redis, and Valkey, zeroing value-bearing throughput so the gate
+// cannot score a ratio. Instead the even seq XADDs one fresh entry and the odd seq
+// delivers exactly one with COUNT 1, so one add balances one delivery and the
+// undelivered pool holds near its preloaded depth for the whole run. That keeps
+// XREADGROUP delivering a populated batch throughout, which is the consumer-group
+// read cost the row measures, and the single-entry COUNT is what makes the add and
+// the delivery cancel one command at a time.
 func XReadGroup(s Spec) Plan {
 	s = s.withDefaults()
 	xadd := []byte("XADD")
@@ -108,7 +112,7 @@ func XReadGroup(s Spec) Plan {
 	group := []byte("GROUP")
 	consumer := []byte("consumer")
 	count := []byte("COUNT")
-	cnt := intArg(rangeWindow)
+	one := intArg(1)
 	streams := []byte("STREAMS")
 	gt := []byte(">")
 	return Plan{
@@ -120,9 +124,14 @@ func XReadGroup(s Spec) Plan {
 			}
 			return [][]byte{xadd, sk, star, field, val}
 		},
-		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{xreadgroup, group, grp, consumer, count, cnt, streams, sk, gt}
-		},
+		Probe: sustained(
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{xadd, sk, star, field, val}
+			},
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{xreadgroup, group, grp, consumer, count, one, streams, sk, gt}
+			},
+		),
 	}
 }
 

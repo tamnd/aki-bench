@@ -73,3 +73,64 @@ func TestPreloadCoversMemberSpace(t *testing.T) {
 		t.Fatalf("preload covered %d distinct members, want 256 (%s ...)", len(seen), argvString(plan.Preload(0, 0)))
 	}
 }
+
+// sustained must alternate the re-add and the pop on seq parity so a destructive
+// probe never drains its collection: even seq issues the re-add, odd seq issues the
+// pop, and the two are balanced one command at a time. It also underpins the gate
+// scorer, which zeroes a ratio when every server drains to nil replies, so the
+// balance is what keeps a destructive row scorable.
+func TestSustainedAlternatesAndBalances(t *testing.T) {
+	readd := func(conn int, seq int64) [][]byte { return [][]byte{[]byte("ADD"), refillName(conn, seq)} }
+	pop := func(conn int, seq int64) [][]byte { return [][]byte{[]byte("POP")} }
+	probe := sustained(readd, pop)
+
+	adds, pops := 0, 0
+	names := map[string]int{}
+	const n = 10000
+	for seq := int64(0); seq < n; seq++ {
+		argv := probe(3, seq)
+		switch string(argv[0]) {
+		case "ADD":
+			if seq&1 != 0 {
+				t.Fatalf("seq %d is odd but issued a re-add, want a pop", seq)
+			}
+			adds++
+			names[string(argv[1])]++
+		case "POP":
+			if seq&1 == 0 {
+				t.Fatalf("seq %d is even but issued a pop, want a re-add", seq)
+			}
+			pops++
+		default:
+			t.Fatalf("seq %d issued %q, want ADD or POP", seq, argv[0])
+		}
+	}
+	// Half the ops repopulate, half consume, so the collection holds its cardinality.
+	if adds != n/2 || pops != n/2 {
+		t.Fatalf("adds=%d pops=%d, want %d each (balanced add/pop mix)", adds, pops, n/2)
+	}
+	// Every re-add name is unique, so an add is always a genuine new member and never
+	// a colliding no-op that would let pops outrun adds and drain the collection.
+	for name, count := range names {
+		if count != 1 {
+			t.Fatalf("re-add name %q issued %d times, want 1 (unique per seq)", name, count)
+		}
+	}
+}
+
+// refillName must be unique across connections so two connections re-adding at the
+// same seq never collide: a collision would make one re-add a silent no-op while both
+// connections' pops still removed a member, draining the collection the sustained mix
+// exists to hold.
+func TestRefillNameUniquePerConnection(t *testing.T) {
+	seen := map[string]bool{}
+	for conn := 0; conn < 32; conn++ {
+		for seq := int64(0); seq < 100; seq++ {
+			name := string(refillName(conn, seq))
+			if seen[name] {
+				t.Fatalf("refillName collision at conn %d seq %d: %q", conn, seq, name)
+			}
+			seen[name] = true
+		}
+	}
+}

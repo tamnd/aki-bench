@@ -383,13 +383,12 @@ func ZUnion(s Spec) Plan {
 }
 
 // LPop builds a list of Members elements and probes it with LPOP, the list point
-// read-write. LPOP is destructive, so a sustained run drains the list: size
-// Members at or above the op budget (-duration 0 -requests N with -members >= N)
-// for a run that pops a populated head throughout. Once the list empties LPOP
-// returns nil, which is the same cheap path on aki, Redis, and Valkey alike, so a
-// drained tail does not bias the ratio even though it stops measuring the
-// populated-pop cost. The list is built with RPUSH so the head pops in insertion
-// order.
+// read-write. It is non-draining (sustained): even seq RPUSHes a fresh
+// per-connection element onto the tail, odd seq LPOPs the head, so the list holds
+// its length and LPOP keeps popping a populated head for the whole run. A pure drain
+// empties the list and leaves LPOP returning nil on the same cheap path for all
+// three servers, zeroing value-bearing throughput so the gate cannot score it. The
+// list is built with RPUSH so the head pops in insertion order.
 func LPop(s Spec) Plan {
 	s = s.withDefaults()
 	rpush := []byte("RPUSH")
@@ -400,9 +399,14 @@ func LPop(s Spec) Plan {
 		Preload: func(conn int, seq int64) [][]byte {
 			return [][]byte{rpush, lk, memberName(seq)}
 		},
-		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{lpop, lk}
-		},
+		Probe: sustained(
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{rpush, lk, refillName(conn, seq)}
+			},
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{lpop, lk}
+			},
+		),
 	}
 }
 

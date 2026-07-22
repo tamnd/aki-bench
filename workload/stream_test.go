@@ -28,9 +28,11 @@ func TestXAddIsFlatWrite(t *testing.T) {
 	}
 }
 
-// XRANGE, XREAD, and XREADGROUP must each request a COUNT-bounded window so their
-// cost tracks the window, not the stream length, and each probe must target the
-// stream the preload populated.
+// XRANGE and XREAD must each request a COUNT-bounded window so their cost tracks
+// the window, not the stream length, and each probe must target the stream the
+// preload populated. XREADGROUP is checked separately: it is sustained (non-draining)
+// so its measured read lands on odd seq and delivers a single entry with COUNT 1,
+// the add/deliver balance that keeps the undelivered pool populated.
 func TestStreamReadsAreBounded(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -40,7 +42,6 @@ func TestStreamReadsAreBounded(t *testing.T) {
 	}{
 		{"xrange", "XRANGE", 1, 5},
 		{"xread", "XREAD", 4, 2},
-		{"xreadgroup", "XREADGROUP", 7, 5},
 	}
 	for _, c := range cases {
 		plan, ok := BuildPlan(c.name, Spec{Members: 1000})
@@ -90,13 +91,32 @@ func TestXReadGroupCreatesGroupFirst(t *testing.T) {
 	if string(rest[1]) != "stream:"+collKey {
 		t.Fatalf("xreadgroup: XADD targets %q, want stream:%s", rest[1], collKey)
 	}
-	// The probe must read new messages with the > selector against the group.
-	probe := plan.Probe(0, 0)
+	// The probe is sustained: even seq XADDs one fresh entry, odd seq delivers one
+	// with the > selector, so the undelivered pool holds and the read never drains to
+	// a nil reply. The even re-add keeps the stream key it appends to.
+	readd := plan.Probe(0, 0)
+	if string(readd[0]) != "XADD" || string(readd[1]) != "stream:"+collKey {
+		t.Fatalf("xreadgroup: even-seq probe = %q %q, want XADD re-add on stream:%s", readd[0], readd[1], collKey)
+	}
+	// The odd-seq probe must read new messages with the > selector against the group,
+	// delivering exactly one entry (COUNT 1) so one add balances one delivery.
+	probe := plan.Probe(0, 1)
+	if string(probe[0]) != "XREADGROUP" {
+		t.Fatalf("xreadgroup: odd-seq probe = %q, want XREADGROUP", probe[0])
+	}
 	if string(probe[1]) != "GROUP" || string(probe[2]) != "g" {
 		t.Fatalf("xreadgroup: probe = %q, want GROUP g", probe)
 	}
 	if string(probe[len(probe)-1]) != ">" {
 		t.Fatalf("xreadgroup: probe selector = %q, want > (new messages)", probe[len(probe)-1])
+	}
+	if string(probe[7]) != "stream:"+collKey {
+		t.Fatalf("xreadgroup: probe stream key = %q, want stream:%s", probe[7], collKey)
+	}
+	// COUNT sits at index 5 (XREADGROUP GROUP g consumer COUNT <n>) and must be 1 so
+	// the single delivery matches the single even-seq add.
+	if atoi(t, probe[5]) != 1 {
+		t.Fatalf("xreadgroup: COUNT = %q, want 1 (one delivery per add)", probe[5])
 	}
 }
 
