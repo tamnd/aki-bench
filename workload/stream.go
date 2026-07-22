@@ -141,13 +141,14 @@ func XReadGroup(s Spec) Plan {
 // the Registry, not a Plan.
 func streamPlans() map[string]func(Spec) Plan {
 	return map[string]func(Spec) Plan{
-		"xrange":     XRange,
-		"xread":      XRead,
-		"xreadgroup": XReadGroup,
+		"xrange":      XRange,
+		"xread":       XRead,
+		"xreadgroup":  XReadGroup,
+		"xreadgroupn": XReadGroupN,
 	}
 }
 
 // streamPlanNames lists the stream plan workloads in a stable order.
 func streamPlanNames() []string {
-	return []string{"xrange", "xread", "xreadgroup"}
+	return []string{"xrange", "xread", "xreadgroup", "xreadgroupn"}
 }
