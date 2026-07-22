@@ -9,20 +9,23 @@ func TestRangePlansBuildAndProbe(t *testing.T) {
 	cases := []struct {
 		name      string
 		preloadHd string // expected first token of the preload command
-		probeHd   string // expected first token of the probe command
+		probeHd   string // expected first token of the measured probe command
 		preKeyIdx int    // argv index of the key in the preload command
 		probeKey  string // the key the probe must target
+		// sustained plans alternate a re-add on even seq with the pop on odd seq, so
+		// the measured pop command lands on odd seq, not seq 0.
+		sustained bool
 	}{
-		{"lrange", "RPUSH", "LRANGE", 1, "list:probe"},
-		{"lpop", "RPUSH", "LPOP", 1, "list:probe"},
-		{"lindex", "RPUSH", "LINDEX", 1, "list:probe"},
-		{"zrange", "ZADD", "ZRANGE", 1, "zset:probe"},
-		{"zrangebyscore", "ZADD", "ZRANGEBYSCORE", 1, "zset:probe"},
-		{"hscan", "HSET", "HSCAN", 1, "hash:probe"},
-		{"sscan", "SADD", "SSCAN", 1, "set:probe"},
-		{"smembers", "SADD", "SMEMBERS", 1, "set:probe"},
-		{"hgetall", "HSET", "HGETALL", 1, "hash:probe"},
-		{"xrange", "XADD", "XRANGE", 1, "stream:probe"},
+		{"lrange", "RPUSH", "LRANGE", 1, "list:probe", false},
+		{"lpop", "RPUSH", "LPOP", 1, "list:probe", true},
+		{"lindex", "RPUSH", "LINDEX", 1, "list:probe", false},
+		{"zrange", "ZADD", "ZRANGE", 1, "zset:probe", false},
+		{"zrangebyscore", "ZADD", "ZRANGEBYSCORE", 1, "zset:probe", false},
+		{"hscan", "HSET", "HSCAN", 1, "hash:probe", false},
+		{"sscan", "SADD", "SSCAN", 1, "set:probe", false},
+		{"smembers", "SADD", "SMEMBERS", 1, "set:probe", false},
+		{"hgetall", "HSET", "HGETALL", 1, "hash:probe", false},
+		{"xrange", "XADD", "XRANGE", 1, "stream:probe", false},
 	}
 	for _, c := range cases {
 		plan, ok := BuildPlan(c.name, Spec{Members: 1000})
@@ -36,7 +39,11 @@ func TestRangePlansBuildAndProbe(t *testing.T) {
 		if string(pre[0]) != c.preloadHd {
 			t.Fatalf("%s: preload cmd = %q, want %s", c.name, pre[0], c.preloadHd)
 		}
-		probe := plan.Probe(0, 0)
+		measured := int64(0)
+		if c.sustained {
+			measured = 1
+		}
+		probe := plan.Probe(0, measured)
 		if string(probe[0]) != c.probeHd {
 			t.Fatalf("%s: probe cmd = %q, want %s", c.name, probe[0], c.probeHd)
 		}
@@ -45,6 +52,17 @@ func TestRangePlansBuildAndProbe(t *testing.T) {
 		}
 		if string(pre[c.preKeyIdx]) != c.probeKey {
 			t.Fatalf("%s: preload key = %q, want %s (probe must hit the populated collection)", c.name, pre[c.preKeyIdx], c.probeKey)
+		}
+		// A sustained plan re-adds on even seq so the list never drains: seq 0 is an
+		// RPUSH back onto the same list, balancing the odd-seq pop one at a time.
+		if c.sustained {
+			readd := plan.Probe(0, 0)
+			if string(readd[0]) != c.preloadHd {
+				t.Fatalf("%s: even-seq probe = %q, want %s re-add", c.name, readd[0], c.preloadHd)
+			}
+			if string(readd[1]) != c.probeKey {
+				t.Fatalf("%s: re-add key = %q, want %s", c.name, readd[1], c.probeKey)
+			}
 		}
 	}
 }

@@ -94,22 +94,29 @@ func SAddMember(s Spec) Plan {
 	}
 }
 
-// SRem builds a set of Members members and probes it with SREM on a random member, the
-// destructive member removal. Like HDEL it drains the collection over a sustained run:
-// once a member is gone, re-removing it returns 0, the same cheap path on aki, Redis,
-// and Valkey, so a drained tail does not bias the ratio even though it stops measuring
-// the populated-remove cost. Size Members at or above the op budget for a run that
-// removes a live member throughout.
+// SRem builds a set of Members members and probes it with SREM, the destructive
+// member removal. It is non-draining (sustained): even seq re-adds a fresh
+// per-connection member, odd seq SREMs the one the same connection added on the
+// previous even step, so every remove hits a present member and the set holds its
+// cardinality for the whole run. A pure drain would empty the set and leave SREM
+// returning 0 on the same cheap path for all three servers, zeroing value-bearing
+// throughput so the gate cannot score it; the sustained mix keeps the remove
+// landing on a populated set, the cost the row measures.
 func SRem(s Spec) Plan {
 	s = s.withDefaults()
-	sel := s.memberSelector()
+	sadd := []byte("SADD")
 	srem := []byte("SREM")
 	return Plan{
 		PreloadOps: int64(s.Members),
 		Preload:    setPreload(),
-		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{srem, setProbeKey, memberName(sel(conn, seq))}
-		},
+		Probe: sustained(
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{sadd, setProbeKey, refillName(conn, seq)}
+			},
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{srem, setProbeKey, refillName(conn, seq-1)}
+			},
+		),
 	}
 }
 
@@ -151,21 +158,29 @@ func SRandMemberCount(s Spec) Plan {
 }
 
 // SPop builds a set of Members members and probes it with the no-count SPOP, the
-// destructive random draw. Like SRem it drains the set over a sustained run, one member
-// per probe: it seeks a uniform random member off the ordered index, returns it, and
-// removes it, so it measures the random-select-and-remove path a model must keep O(log n)
-// on both sides rather than counting to the drawn offset. Size Members at or above the op
-// budget so a live member is popped throughout; once drained, SPOP returns nil on the same
-// cheap empty path across aki, Redis, and Valkey.
+// destructive random draw: it seeks a uniform random member off the ordered index,
+// returns it, and removes it, the random-select-and-remove path a model must keep
+// O(log n) rather than counting to the drawn offset. It is non-draining (sustained):
+// even seq re-adds a fresh per-connection member, odd seq SPOPs a random one, so the
+// set holds its cardinality and SPOP keeps drawing from a populated set for the whole
+// run. A pure drain empties the set and leaves SPOP returning nil on the same cheap
+// path for all three servers, zeroing value-bearing throughput so the gate cannot
+// score it.
 func SPop(s Spec) Plan {
 	s = s.withDefaults()
+	sadd := []byte("SADD")
 	spop := []byte("SPOP")
 	return Plan{
 		PreloadOps: int64(s.Members),
 		Preload:    setPreload(),
-		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{spop, setProbeKey}
-		},
+		Probe: sustained(
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{sadd, setProbeKey, refillName(conn, seq)}
+			},
+			func(conn int, seq int64) [][]byte {
+				return [][]byte{spop, setProbeKey}
+			},
+		),
 	}
 }
 

@@ -8,16 +8,19 @@ import "testing"
 func TestSetPlansBuildAndProbe(t *testing.T) {
 	cases := []struct {
 		name    string
-		probeHd string // expected first token of the probe command
+		probeHd string // expected first token of the measured (pop) probe command
+		// sustained plans alternate a re-add on even seq with the pop on odd seq, so
+		// their measured command is the odd-seq token; the shared table probes odd.
+		sustained bool
 	}{
-		{"scard", "SCARD"},
-		{"smismember", "SMISMEMBER"},
-		{"saddmember", "SADD"},
-		{"srem", "SREM"},
-		{"srandmember", "SRANDMEMBER"},
-		{"srandmembercount", "SRANDMEMBER"},
-		{"spop", "SPOP"},
-		{"smove", "SMOVE"},
+		{"scard", "SCARD", false},
+		{"smismember", "SMISMEMBER", false},
+		{"saddmember", "SADD", false},
+		{"srem", "SREM", true},
+		{"srandmember", "SRANDMEMBER", false},
+		{"srandmembercount", "SRANDMEMBER", false},
+		{"spop", "SPOP", true},
+		{"smove", "SMOVE", false},
 	}
 	for _, c := range cases {
 		plan, ok := BuildPlan(c.name, Spec{Members: 1000})
@@ -31,13 +34,29 @@ func TestSetPlansBuildAndProbe(t *testing.T) {
 		if string(pre[0]) != "SADD" {
 			t.Fatalf("%s: preload cmd = %q, want SADD", c.name, pre[0])
 		}
-		probe := plan.Probe(0, 0)
+		// For sustained plans the measured pop lands on odd seq; for the rest seq 0.
+		measured := int64(0)
+		if c.sustained {
+			measured = 1
+		}
+		probe := plan.Probe(0, measured)
 		if string(probe[0]) != c.probeHd {
 			t.Fatalf("%s: probe cmd = %q, want %s", c.name, probe[0], c.probeHd)
 		}
 		// The probe must target the same set the preload wrote.
 		if string(probe[1]) != string(pre[1]) {
 			t.Fatalf("%s: probe key %q != preload key %q", c.name, probe[1], pre[1])
+		}
+		// A sustained plan re-adds on even seq so the set never drains: seq 0 is an
+		// SADD into the same set, balancing the odd-seq pop one command at a time.
+		if c.sustained {
+			readd := plan.Probe(0, 0)
+			if string(readd[0]) != "SADD" {
+				t.Fatalf("%s: even-seq probe = %q, want SADD re-add", c.name, readd[0])
+			}
+			if string(readd[1]) != string(pre[1]) {
+				t.Fatalf("%s: re-add key %q != preload key %q", c.name, readd[1], pre[1])
+			}
 		}
 	}
 }
@@ -104,11 +123,21 @@ func TestSetMIsMemberWindow(t *testing.T) {
 // argument, so the server picks the member: this is the O(log n) random-seek path the
 // audit measures, not a client-chosen point probe.
 func TestSetRandomNoArgProbe(t *testing.T) {
-	for _, name := range []string{"srandmember", "spop"} {
-		plan, _ := BuildPlan(name, Spec{Members: 1000})
-		probe := plan.Probe(0, 0)
+	// srandmember is non-destructive so its probe is the bare command on every seq;
+	// spop is sustained so its bare-command pop lands on odd seq (even re-adds), so
+	// each is probed on a seq where it issues the measured no-arg draw.
+	cases := []struct {
+		name string
+		seq  int64
+	}{
+		{"srandmember", 0},
+		{"spop", 1},
+	}
+	for _, c := range cases {
+		plan, _ := BuildPlan(c.name, Spec{Members: 1000})
+		probe := plan.Probe(0, c.seq)
 		if len(probe) != 2 {
-			t.Fatalf("%s: probe has %d tokens, want 2 (cmd + key)", name, len(probe))
+			t.Fatalf("%s: probe has %d tokens, want 2 (cmd + key)", c.name, len(probe))
 		}
 	}
 }
