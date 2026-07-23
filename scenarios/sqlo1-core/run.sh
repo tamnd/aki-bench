@@ -198,10 +198,15 @@ for scale in $SCALES; do
     fi
 
     if [ "$AKISLOT" = sqlo1 ]; then
-      # S0 sqlo1srv has no memory cap flag yet; on the cap arm it simply runs,
-      # and its VmHWM column reports what that costs. Once the real store
-      # lands, its cache budget flag goes here.
-      (cd "$celldir/aki" && exec "$SQLO1SRV" -addr 127.0.0.1:$PORT_AKI) >"$celldir/aki.log" 2>&1 &
+      # The real single-file store (SQLO1_STORE=mem falls back to the S0
+      # placeholder for a plumbing check). sqlo1srv still has no memory cap
+      # flag; on the cap arm it simply runs, and its VmHWM column reports
+      # what that costs. Once the budget flag lands it goes here.
+      sqlo1_flags=()
+      if [ "${SQLO1_STORE:-file}" = file ]; then
+        sqlo1_flags=(-store file -path "$celldir/aki/data.aki")
+      fi
+      (cd "$celldir/aki" && exec "$SQLO1SRV" -addr 127.0.0.1:$PORT_AKI "${sqlo1_flags[@]}") >"$celldir/aki.log" 2>&1 &
     else
       if [ "$arm" = cap ]; then
         res_mib=$(( CAP_MIB / SHARDS ))
