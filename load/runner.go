@@ -284,6 +284,12 @@ func warm(ctx context.Context, cfg Config, clients []*Client) {
 func driveClosed(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Config, perConnReq int64, cts *counters) {
 	var seq int64
 	var issued int64
+	// The pipeline depth is fixed for the run, so the send-time scratch is allocated
+	// once and reused across batches. A per-batch make here would add one heap slice
+	// per pipeline round on the client's hot path, which on a saturating run turns the
+	// load generator into its own GC bottleneck and understates the server's ceiling.
+	batch := cfg.Pipeline
+	sendTimes := make([]time.Time, batch)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -292,8 +298,6 @@ func driveClosed(ctx context.Context, conn int, cl *Client, h *Histogram, cfg Co
 			return
 		}
 
-		batch := cfg.Pipeline
-		sendTimes := make([]time.Time, batch)
 		for i := 0; i < batch; i++ {
 			argv := cfg.Gen(conn, seq)
 			seq++

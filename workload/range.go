@@ -219,11 +219,17 @@ func SInter(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sinter := []byte("SINTER")
+	// The two source keys are fixed, so the whole argument vector is a constant. Build
+	// it once and return the same slice every probe: the load generator only reads argv
+	// to serialize it, so a shared read-only vector across connections is safe and keeps
+	// the measuring client from allocating one slice header per probe, which on a
+	// saturating merge run would make the client its own bottleneck.
+	argv := [][]byte{sinter, setAKey, setBKey}
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sinter, setAKey, setBKey}
+			return argv
 		},
 	}
 }
@@ -236,11 +242,12 @@ func SUnion(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sunion := []byte("SUNION")
+	argv := [][]byte{sunion, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sunion, setAKey, setBKey}
+			return argv
 		},
 	}
 }
@@ -254,11 +261,12 @@ func SDiff(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sdiff := []byte("SDIFF")
+	argv := [][]byte{sdiff, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sdiff, setAKey, setBKey}
+			return argv
 		},
 	}
 }
@@ -273,11 +281,12 @@ func SInterCard(s Spec) Plan {
 	sadd := []byte("SADD")
 	sintercard := []byte("SINTERCARD")
 	two := []byte("2")
+	argv := [][]byte{sintercard, two, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sintercard, two, setAKey, setBKey}
+			return argv
 		},
 	}
 }
@@ -292,11 +301,12 @@ func SInterStore(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sinterstore := []byte("SINTERSTORE")
+	argv := [][]byte{sinterstore, setDest, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sinterstore, setDest, setAKey, setBKey}
+			return argv
 		},
 	}
 }
@@ -311,11 +321,12 @@ func SUnionStore(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sunionstore := []byte("SUNIONSTORE")
+	argv := [][]byte{sunionstore, setDest, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sunionstore, setDest, setAKey, setBKey}
+			return argv
 		},
 	}
 }
@@ -328,11 +339,12 @@ func SDiffStore(s Spec) Plan {
 	s = s.withDefaults()
 	sadd := []byte("SADD")
 	sdiffstore := []byte("SDIFFSTORE")
+	argv := [][]byte{sdiffstore, setDest, setAKey, setBKey} // constant argv, shared across probes (see SInter)
 	return Plan{
 		PreloadOps: int64(s.Members) * 2,
 		Preload:    algebraPreload(sadd, s.Members),
 		Probe: func(conn int, seq int64) [][]byte {
-			return [][]byte{sdiffstore, setDest, setAKey, setBKey}
+			return argv
 		},
 	}
 }
